@@ -8,10 +8,11 @@ LOAD_PATH := -L . \
 	-L $(NERD_ICONS_DIR)
 
 PACKAGES := agents-workflow.el claude-dashboard.el codex-cli.el \
-	databricks-runs.el jira-board.el slack-monitor.el
+	databricks-runs.el jira-board.el slack-monitor.el github-prs.el
 
 TEST_FILES := agents-workflow-tests.el claude-dashboard-tests.el \
-	codex-cli-tests.el databricks-runs-tests.el slack-monitor-tests.el
+	codex-cli-tests.el databricks-runs-tests.el slack-monitor-tests.el \
+	github-prs-tests.el
 
 .PHONY: all test compile checkdoc clean
 

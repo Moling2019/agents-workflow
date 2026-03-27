@@ -43,7 +43,8 @@
     (databricks  :icon "storage"         :face (:foreground "#fab387"))
     (pulls       :icon "merge_type"      :face (:foreground "#cba6f7"))
     (channels    :icon "forum"           :face (:foreground "#a6e3a1"))
-    (jira        :icon "assignment"      :face (:foreground "#89b4fa")))
+    (jira        :icon "assignment"      :face (:foreground "#89b4fa"))
+    (github      :icon "merge_type"      :face (:foreground "#cba6f7")))
   "Icon registry for dashboard panels.
 Each entry is (NAME :icon MATERIAL-ICON-NAME :face FACE-SPEC).")
 

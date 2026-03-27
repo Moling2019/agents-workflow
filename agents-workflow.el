@@ -121,7 +121,8 @@ BACKEND selects the CLI tool: `claude' (default) or `codex'."
 (defvar agents-workflow-panel-registry
   '(("databricks" . databricks-runs-panel)
     ("jira" . jira-board-panel)
-    ("slack" . slack-monitor-panel))
+    ("slack" . slack-monitor-panel)
+    ("github" . github-prs-panel))
   "Alist mapping panel name strings to constructor functions.
 Each constructor is a zero-arg function returning a panel plist.")
 

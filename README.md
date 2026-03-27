@@ -169,6 +169,7 @@ Each panel has its own `defcustom` variables for configuration:
 - **databricks-runs** -- `databricks-runs-python`, `databricks-runs-env-file`, `databricks-runs-cli-profile`, `databricks-runs-repo-dir`
 - **jira-board** -- `jira-board-python`, `jira-board-env-file`, `jira-board-site`, `jira-board-project`
 - **slack-monitor** -- `slack-monitor-cache-file`, `slack-monitor-ignore-file`
+- **github-prs** -- `github-prs-author`, `github-prs-state`, `github-prs-limit`, `github-prs-refresh-interval`, `github-prs-enrich`, `github-prs-gh-program`
 
 ## Architecture
 
@@ -180,6 +181,7 @@ codex-cli.el                OpenAI Codex CLI terminal management
 databricks-runs.el          Optional: Databricks job run monitoring panel
 jira-board.el               Optional: Jira issue board panel
 slack-monitor.el            Optional: Slack message monitoring panel
+github-prs.el               Optional: GitHub PRs monitoring panel
 ```
 
 `agents-workflow.el` depends on `claude-code.el` for Claude backend support
