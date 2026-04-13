@@ -110,30 +110,47 @@ Handles the subset of ISO 8601 that `gh' outputs."
     (claude-dashboard-icon 'pending))
    (t "")))
 
+(defun github-prs--build-check-p (check)
+  "Return non-nil if CHECK is an actual build/CI check.
+Excludes meta-checks like pullapprove, aviator, and PullApprove Config."
+  (let* ((name (or (alist-get 'name check)
+                   (alist-get 'context check)
+                   ""))
+         (down (downcase name)))
+    (not (or (string-match-p "pullapprove" down)
+             (string-match-p "aviator" down)
+             (string-match-p "graphite" down)
+             (string-match-p "sox" down)))))
+
 (defun github-prs--ci-icon (rollup)
-  "Return icon string for CI status ROLLUP.
-ROLLUP is a vector of alists with `state' or `conclusion' keys."
+  "Return icon string for build status from ROLLUP.
+ROLLUP is a vector of alists with `state' or `conclusion' keys.
+Only considers actual build checks, not approval/meta checks."
   (require 'claude-dashboard)
   (if (or (null rollup) (= (length rollup) 0))
       ""
-    (let ((states (mapcar (lambda (c)
-                            (or (alist-get 'conclusion c)
-                                (alist-get 'state c)
-                                ""))
-                          (append rollup nil))))
-      (cond
-       ((cl-some (lambda (s) (member s '("FAILURE" "ERROR" "TIMED_OUT"
-                                          "ACTION_REQUIRED" "STARTUP_FAILURE")))
-                 states)
-        (claude-dashboard-icon 'failed))
-       ((cl-some (lambda (s) (member s '("PENDING" "" "QUEUED" "IN_PROGRESS"
-                                          "WAITING" "REQUESTED")))
-                 states)
-        (claude-dashboard-icon 'running))
-       ((cl-every (lambda (s) (member s '("SUCCESS" "NEUTRAL" "SKIPPED")))
-                  states)
-        (claude-dashboard-icon 'success))
-       (t "")))))
+    (let* ((checks (cl-remove-if-not #'github-prs--build-check-p
+                                      (append rollup nil)))
+           (states (mapcar (lambda (c)
+                             (or (alist-get 'conclusion c)
+                                 (alist-get 'state c)
+                                 ""))
+                           checks)))
+      (if (null states)
+          ""
+        (cond
+         ((cl-some (lambda (s) (member s '("FAILURE" "ERROR" "TIMED_OUT"
+                                            "ACTION_REQUIRED" "STARTUP_FAILURE")))
+                   states)
+          (claude-dashboard-icon 'failed))
+         ((cl-some (lambda (s) (member s '("PENDING" "" "QUEUED" "IN_PROGRESS"
+                                            "WAITING" "REQUESTED")))
+                   states)
+          (claude-dashboard-icon 'running))
+         ((cl-every (lambda (s) (member s '("SUCCESS" "NEUTRAL" "SKIPPED")))
+                    states)
+          (claude-dashboard-icon 'success))
+         (t ""))))))
 
 ;;; --- Repo short name ---
 
@@ -301,6 +318,62 @@ ROLLUP is a vector of alists with `state' or `conclusion' keys."
           (message "No URL for %s" row-id)))
     (message "PR %s not found" row-id)))
 
+(defcustom github-prs-repo-root "~/Documents/work/repos/"
+  "Local directory containing cloned repositories.
+Used to resolve repo names to local paths for forge integration."
+  :type 'directory
+  :group 'github-prs)
+
+(defun github-prs--local-repo-dir (pr)
+  "Return the local directory for PR's repository, or nil."
+  (let* ((repo-obj (alist-get 'repository pr))
+         (full-name (alist-get 'nameWithOwner repo-obj))
+         (repo-name (and full-name (file-name-nondirectory full-name)))
+         (dir (and repo-name
+                   (expand-file-name repo-name github-prs-repo-root))))
+    (when (and dir (file-directory-p dir))
+      dir)))
+
+(defun github-prs--review (_panel row-id)
+  "Show a magit-diff for the PR at ROW-ID.
+Fetches the latest remote refs, then diffs origin/HEAD...pr-branch."
+  (if-let ((pr (github-prs--find-pr row-id)))
+      (let* ((url (alist-get 'url pr))
+             (number (alist-get 'number pr))
+             (repo-dir (github-prs--local-repo-dir pr)))
+        (cond
+         ((null repo-dir)
+          (if url (browse-url url) (message "PR %s not found locally" row-id))
+          (message "Repo not cloned locally. Opened in browser."))
+         (t
+          (let ((default-directory repo-dir))
+            ;; Get branch names first (fast, no fetch needed)
+            (let* ((pr-json (shell-command-to-string
+                             (format "%s pr view %d --json headRefName,baseRefName"
+                                     github-prs-gh-program number)))
+                   (parsed (condition-case nil (json-read-from-string pr-json) (error nil)))
+                   (head (and parsed (alist-get 'headRefName parsed)))
+                   (base (and parsed (alist-get 'baseRefName parsed))))
+              (if (not (and head base))
+                  (message "Could not determine PR branches for #%d" number)
+                ;; Fetch just the two branches we need, then show diff
+                (message "Fetching PR #%s branches..." number)
+                (let* ((dir repo-dir)
+                       (range (format "origin/%s...origin/%s" base head))
+                       (proc (start-process
+                              "github-prs-fetch" nil
+                              "git" "-C" dir "fetch" "origin"
+                              (format "+refs/heads/%s:refs/remotes/origin/%s" head head)
+                              (format "+refs/heads/%s:refs/remotes/origin/%s" base base))))
+                  (set-process-sentinel
+                   proc
+                   (lambda (p _event)
+                     (when (= (process-exit-status p) 0)
+                       (let ((default-directory dir))
+                         (magit-diff-range range))
+                       (message "PR #%s ready." number)))))))))))
+    (message "PR %s not found" row-id)))
+
 ;;; --- Panel constructor ---
 
 (defun github-prs-panel ()
@@ -310,10 +383,11 @@ For use with `claude-dashboard-create'."
    :name "github"
    :title "GitHub PRs"
    :columns [("Repo" 20 nil) ("#" 6 nil) ("Title" 0 nil)
-             ("Rev" 3 nil) ("CI" 3 nil) ("Age" 8 nil)]
+             ("Rev" 5 nil) ("Build" 5 nil) ("Age" 8 nil)]
    :entries #'github-prs--panel-entries
    :refresh #'github-prs--fetch
    :actions `(("RET" . ,#'github-prs--browse)
+              ("r"   . ,#'github-prs--review)
               ("w"   . ,#'github-prs--copy-url))
    :interval github-prs-refresh-interval
    :context nil))

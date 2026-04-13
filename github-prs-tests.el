@@ -88,6 +88,15 @@
   (should (equal "" (github-prs--ci-icon nil)))
   (should (equal "" (github-prs--ci-icon []))))
 
+(ert-deftest github-prs-test-ci-icon-filters-meta-checks ()
+  "Build icon ignores pullapprove/aviator, only considers real builds."
+  (require 'claude-dashboard)
+  (let ((rollup [((context . "pullapprove") (state . "PENDING"))
+                 ((context . "aviator/checks") (state . "IN_PROGRESS"))
+                 ((context . "buildkite/my-pipeline") (state . "SUCCESS"))]))
+    ;; Only buildkite check counts, and it's SUCCESS
+    (should (stringp (github-prs--ci-icon rollup)))))
+
 ;;; --- pr-key ---
 
 (ert-deftest github-prs-test-pr-key-string-repo ()

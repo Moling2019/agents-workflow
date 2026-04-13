@@ -1,5 +1,4 @@
 ;;; codex-cli.el --- Minimal library for OpenAI Codex CLI terminals -*- lexical-binding: t; -*-
-;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; Author: Moling Zhang
 ;; Version: 0.2.0
@@ -9,7 +8,7 @@
 ;;; Commentary:
 ;; Provides buffer management, terminal launch, command sending, and
 ;; timer-based status detection for OpenAI Codex CLI sessions running
-;; in eat terminals.  Designed as a companion to agents-workflow.el.
+;; in eat terminals.  Designed as a companion to claude-workflow.el.
 ;;
 ;; Status detection uses the same approach as ai-code-interface.el:
 ;; after each meaningful terminal output, reset an idle timer.  When

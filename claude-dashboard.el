@@ -1,5 +1,4 @@
 ;;; claude-dashboard.el --- Composable panel dashboard -*- lexical-binding: t; -*-
-;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; Author: Moling Zhang
 ;; Version: 0.1.0
@@ -44,7 +43,8 @@
     (pulls       :icon "merge_type"      :face (:foreground "#cba6f7"))
     (channels    :icon "forum"           :face (:foreground "#a6e3a1"))
     (jira        :icon "assignment"      :face (:foreground "#89b4fa"))
-    (github      :icon "merge_type"      :face (:foreground "#cba6f7")))
+    (github      :icon "merge_type"      :face (:foreground "#cba6f7"))
+    (pace        :icon "dns"             :face (:foreground "#94e2d5")))
   "Icon registry for dashboard panels.
 Each entry is (NAME :icon MATERIAL-ICON-NAME :face FACE-SPEC).")
 

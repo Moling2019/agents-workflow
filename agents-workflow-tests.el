@@ -1,5 +1,4 @@
-;;; agents-workflow-tests.el --- Tests for agents-workflow.el -*- lexical-binding: t; -*-
-;; SPDX-License-Identifier: GPL-3.0-or-later
+;;; agents-workflow-tests.el --- Tests for agents-workflow -*- lexical-binding: t; -*-
 
 ;;; Code:
 (require 'ert)
@@ -332,8 +331,9 @@
                   (should (eq (agents-workflow-agent-status agent) 'waiting))
                   ;; Last activity updated
                   (should (agents-workflow-agent-last-activity agent))
-                  ;; Last output extracted from buffer
-                  (should (string-match-p "Claude output" (agents-workflow-agent-last-output agent)))
+                  ;; Last output is NOT set by mark-agent-waiting
+                  ;; (set exclusively by the stop hook)
+                  (should (null (agents-workflow-agent-last-output agent)))
                   ;; Event emitted
                   (should called-with)
                   (should (eq (plist-get called-with :event) 'worker-waiting))

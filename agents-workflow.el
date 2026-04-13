@@ -1,17 +1,16 @@
-;;; agents-workflow.el --- Orchestrate multiple AI coding agent sessions -*- lexical-binding: t; -*-
-;; SPDX-License-Identifier: GPL-3.0-or-later
+;;; agents-workflow.el --- Orchestrate multiple Claude Code sessions -*- lexical-binding: t; -*-
 
 ;; Author: Moling Zhang
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "30.0") (claude-code "0.4.5") (all-the-icons "5.0.0"))
 ;; Keywords: tools, ai
-;; URL: https://github.com/moling2019/agents-workflow.el
+;; URL: https://github.com/moling3650/agents-workflow.el
 
 ;;; Commentary:
-;; An Emacs package for orchestrating multiple AI coding agent sessions
-;; (Claude Code, OpenAI Codex CLI) as a coordinated workflow.  Tracks
-;; interactive coding agents alongside autonomous background agents with
-;; a unified dashboard, event/trigger system, and optional monitoring panels.
+;; An Emacs package for orchestrating multiple Claude Code sessions as a
+;; coordinated workflow.  Tracks interactive coding agents alongside
+;; autonomous background agents with a unified dashboard, event/trigger
+;; system, and Slack monitoring.
 
 ;;; Code:
 (require 'cl-lib)
@@ -22,6 +21,7 @@
 (require 'databricks-runs nil t)
 (require 'jira-board nil t)
 (require 'slack-monitor nil t)
+(require 'pace-jobs nil t)
 
 ;; Forward declarations for claude-code.el
 (declare-function claude-code "claude-code")
@@ -46,17 +46,9 @@
 (defvar claude-code-process-environment-functions)
 (defvar claude-code-start-hook)
 
-;; Forward declare defcustoms used before their definitions
-(defvar agents-workflow-elisp-directory)
-(defvar agents-workflow-last-output-lines)
-
-;; Forward declarations for eat
-(declare-function eat-term-set-parameter "eat")
-(defvar eat-terminal)
-
 ;;;; Customization group
 (defgroup agents-workflow nil
-  "Orchestrate multiple AI coding agent sessions."
+  "Orchestrate multiple Claude Code sessions."
   :group 'tools
   :prefix "agents-workflow-")
 
@@ -119,15 +111,18 @@ BACKEND selects the CLI tool: `claude' (default) or `codex'."
   "Hash table of defined workflows, keyed by name.")
 
 (defvar agents-workflow-panel-registry
-  '(("databricks" . databricks-runs-panel)
-    ("jira" . jira-board-panel)
-    ("slack" . slack-monitor-panel)
-    ("github" . github-prs-panel))
-  "Alist mapping panel name strings to constructor functions.
-Each constructor is a zero-arg function returning a panel plist.")
+  '(("databricks" databricks-runs-panel . databricks-runs)
+    ("jira" jira-board-panel . jira-board)
+    ("slack" slack-monitor-panel . slack-monitor)
+    ("github" github-prs-panel . github-prs)
+    ("pace" pace-jobs-panel . pace-jobs))
+  "Alist mapping panel name strings to (CONSTRUCTOR . FEATURE).
+Each constructor is a zero-arg function returning a panel plist.
+FEATURE is the symbol to `require' if the constructor is not yet loaded.")
 
 (defvar agents-workflow--expanded-agents (make-hash-table :test 'equal)
   "Hash table of agent names currently showing expanded directory view.")
+
 
 ;;;; Backend abstraction
 
@@ -390,6 +385,10 @@ fall back to the default `agents-workflow--type-config'."
         (string-match-p "\\`[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠂⠐✳● ]*\\'" trimmed)
         ;; Error noise from terminal
         (string-match-p "\\`\\*ERROR\\*" trimmed)
+        ;; Buddy companion pet lines (raw &_ or cleaned (✦>) pattern)
+        (string-match-p "&_" trimmed)
+        (string-match-p "(✦>)" trimmed)
+        (string-match-p "Brinecaw" trimmed)
         ;; No alphanumeric content at all
         (not (string-match-p "[[:alnum:]]" trimmed)))))
 
@@ -438,8 +437,7 @@ sentence of the agent's last response rather than a trailing fragment."
 
 (defun agents-workflow--last-output-column-offset ()
   "Compute the character offset where the Last Output column starts.
-Sums widths and padding of all preceding columns from the agents
-panel definition."
+Sums widths and padding of all preceding columns from the agents panel definition."
   (let ((offset 2)  ;; leading indent
         (columns [("Agent" 16 t) ("T" 3 t) ("S" 3 nil) ("Dir" 18 nil) ("Activity" 10 nil)])
         (padding 2))
@@ -509,16 +507,16 @@ cycle rather than relying solely on the title-watcher event.
 When an agent is expanded, extra directory sub-rows are appended."
   (mapcan
    (lambda (agent)
-     (let ((buf (agents-workflow-agent-buffer agent)))
-       (if (and buf (buffer-live-p buf))
-           (setf (agents-workflow-agent-last-output agent)
-                 (agents-workflow--extract-last-output
-                  buf agents-workflow-last-output-lines))
-         (when (and (eq (agents-workflow-agent-type agent) 'interactive)
-                    buf
-                    (not (eq (agents-workflow-agent-status agent) 'idle)))
-           (setf (agents-workflow-agent-status agent) 'idle)
-           (setf (agents-workflow-agent-buffer agent) nil))))
+     ;; Try to reconnect stale/nil buffer references on each refresh
+     (let ((buf (or (agents-workflow--ensure-agent-buffer agent)
+                    (agents-workflow-agent-buffer agent))))
+       ;; Detect dead buffers and mark agent idle
+       (when (and (not (and buf (buffer-live-p buf)))
+                  (eq (agents-workflow-agent-type agent) 'interactive)
+                  buf
+                  (not (eq (agents-workflow-agent-status agent) 'idle)))
+         (setf (agents-workflow-agent-status agent) 'idle)
+         (setf (agents-workflow-agent-buffer agent) nil)))
      (let ((main-row
             (list (agents-workflow-agent-name agent)
                   (vector
@@ -652,6 +650,9 @@ the live buffer or nil."
                         candidates)))
         (when (and matching (buffer-live-p matching))
           (setf (agents-workflow-agent-buffer agent) matching)
+          ;; Re-install title watcher so the closure captures this
+          ;; agent object (not a stale one from a previous session)
+          (agents-workflow--install-title-watcher agent)
           matching)))))
 
 (defun agents-workflow--panel-visit-agent (wf-name row-id)
@@ -857,7 +858,7 @@ the user chose to use the base directory directly."
                                           (list (abbreviate-file-name wf-dir) "Other directory...")
                                           nil t nil nil (abbreviate-file-name wf-dir))))
                           (if (equal dir-choice "Other directory...")
-                              (read-directory-name "Agent directory: " "~/")
+                              (read-directory-name "Agent directory: " "~/Documents/work/")
                             (expand-file-name dir-choice))))
              (result (agents-workflow--prompt-worktree base-dir name))
              (agent-dir (car result))
@@ -901,7 +902,7 @@ with the new --add-dir flag if it is running."
                                            (list (abbreviate-file-name wf-dir) "Other directory...")
                                            nil t nil nil "Other directory...")))
                          (if (equal dir-choice "Other directory...")
-                             (read-directory-name "Directory: " "~/")
+                             (read-directory-name "Directory: " "~/Documents/work/")
                            (expand-file-name dir-choice))))
              (result (agents-workflow--prompt-worktree base-dir
                        (agents-workflow-agent-name agent)))
@@ -1048,10 +1049,15 @@ If WORKFLOW-NAME is nil, prompt from registered workflows."
     (let ((panels (list (agents-workflow-agents-panel wf))))
       ;; Add optional panels listed in the workflow definition
       (dolist (panel-name (agents-workflow-panels wf))
-        (when-let ((constructor (alist-get panel-name agents-workflow-panel-registry
-                                           nil nil #'equal)))
-          (when (fboundp constructor)
-            (setq panels (append panels (list (funcall constructor)))))))
+        (when-let ((entry (alist-get panel-name agents-workflow-panel-registry
+                                     nil nil #'equal)))
+          (let ((constructor (car entry))
+                (feature (cdr entry)))
+            ;; Auto-require the feature so deferred packages get loaded
+            (unless (fboundp constructor)
+              (require feature nil t))
+            (when (fboundp constructor)
+              (setq panels (append panels (list (funcall constructor))))))))
       (pop-to-buffer
        (claude-dashboard-create
         :name name
@@ -1335,6 +1341,17 @@ WORKFLOW is used for emitting completion events."
            (raw (buffer-substring-no-properties start end)))
       (replace-regexp-in-string "\033\\[[0-9;]*[a-zA-Z]" "" raw))))
 
+(defun agents-workflow--extract-last-assistant-message (json-data)
+  "Extract the last_assistant_message field from JSON-DATA string.
+Returns the message text, or nil if not found or parse error."
+  (when (and json-data (not (string-empty-p json-data)))
+    (condition-case nil
+        (let* ((parsed (json-read-from-string json-data))
+               (text (alist-get 'last_assistant_message parsed)))
+          (when (and text (stringp text) (not (string-empty-p text)))
+            text))
+      (error nil))))
+
 (defun agents-workflow--find-agent-by-buffer (workflow buffer-name)
   "Find the agent in WORKFLOW whose buffer matches BUFFER-NAME."
   (cl-find-if
@@ -1351,16 +1368,22 @@ WORKFLOW is used for emitting completion events."
 
 (defun agents-workflow--handle-claude-event (event)
   "Handle an event from `claude-code-event-hook'.
-EVENT is a plist with :type and :buffer-name."
+EVENT is a plist with :type, :buffer-name, and :json-data."
   (let ((buffer-name (plist-get event :buffer-name))
-        (type (plist-get event :type)))
+        (type (format "%s" (plist-get event :type))))
     (maphash
      (lambda (_name wf)
-       (when (eq (agents-workflow-state wf) 'running)
-         (when-let ((agent (agents-workflow--find-agent-by-buffer wf buffer-name)))
-           (pcase type
-             ("notification"
-              (agents-workflow--mark-agent-waiting agent wf))))))
+       (when-let ((agent (agents-workflow--find-agent-by-buffer wf buffer-name)))
+         (pcase type
+           ("stop"
+            ;; Extract last assistant message directly from the hook JSON
+            (let ((text (agents-workflow--extract-last-assistant-message
+                         (plist-get event :json-data))))
+              (when text
+                (setf (agents-workflow-agent-last-output agent) text))
+              (agents-workflow--mark-agent-waiting agent wf)))
+           ("notification"
+            (agents-workflow--mark-agent-waiting agent wf)))))
      agents-workflow--registry)))
 
 (defun agents-workflow--handle-bell (_terminal)
@@ -1376,14 +1399,11 @@ _TERMINAL is the eat terminal parameter (ignored)."
      agents-workflow--registry)))
 
 (defun agents-workflow--mark-agent-waiting (agent workflow)
-  "Mark AGENT as waiting and emit worker-waiting event in WORKFLOW."
+  "Mark AGENT as waiting and emit worker-waiting event in WORKFLOW.
+Last-output is set exclusively by the stop hook via
+`agents-workflow--extract-last-assistant-message'."
   (setf (agents-workflow-agent-status agent) 'waiting)
   (setf (agents-workflow-agent-last-activity agent) (float-time))
-  (when-let ((buf (agents-workflow-agent-buffer agent)))
-    (when (buffer-live-p buf)
-      (setf (agents-workflow-agent-last-output agent)
-            (agents-workflow--extract-last-output
-             buf agents-workflow-last-output-lines))))
   (agents-workflow--emit workflow
                         `(:event worker-waiting
                           :agent ,(agents-workflow-agent-name agent)
@@ -1435,8 +1455,6 @@ STATUS is `idle' or `working'.  Updates the corresponding agent."
                ('idle
                 (setf (agents-workflow-agent-status agent) 'waiting)
                 (setf (agents-workflow-agent-last-activity agent) (float-time))
-                (setf (agents-workflow-agent-last-output agent)
-                      (agents-workflow--extract-last-output buffer agents-workflow-last-output-lines))
                 (agents-workflow--emit wf
                   `(:event worker-waiting
                     :agent ,(agents-workflow-agent-name agent))))
@@ -1501,10 +1519,6 @@ indicates the CLI is idle/waiting (defaults to the global pattern)."
       (unless (eq (agents-workflow-agent-status agent) 'waiting)
         (setf (agents-workflow-agent-status agent) 'waiting)
         (setf (agents-workflow-agent-last-activity agent) (float-time))
-        (setf (agents-workflow-agent-last-output agent)
-              (when (buffer-live-p buf)
-                (agents-workflow--extract-last-output
-                 buf agents-workflow-last-output-lines)))
         (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
           (agents-workflow--emit wf
             `(:event worker-waiting
@@ -1644,8 +1658,7 @@ If the agent has a session-id, resumes that session with --resume."
 
 (defun agents-workflow--send-context-to-agent (agent workflow)
   "Send WORKFLOW's context file contents to interactive AGENT.
-Sends it as the first message after a short delay to let the
-terminal initialize."
+Sends it as the first message after a short delay to let the terminal initialize."
   (when-let ((content (agents-workflow--read-context-file workflow)))
     (let ((buf (agents-workflow-agent-buffer agent))
           (msg (format "Read and internalize this workflow context. Do NOT take any action yet, just acknowledge you've read it.\n\n%s" content)))
@@ -1701,8 +1714,7 @@ If REQUESTER-NAME is nil, just sends the question without routing the
 response back.  Returns a status message.
 
 Designed to be called from agents via emacsclient:
-  emacsclient -e \\='(agents-workflow-ask-agent
-    \"worker\" \"What is X?\" \"slack-monitor\")\\='"
+  emacsclient -e \\='(agents-workflow-ask-agent \"worker\" \"What is X?\" \"slack-monitor\")\\='"
   (let ((wf nil) (target nil))
     ;; Find the workflow and target agent
     (maphash (lambda (_name w)
@@ -1832,7 +1844,7 @@ Kills autonomous agents, cancels timers, unlinks interactive agents."
                       workflow-name (error-message-string err))))
 
     ;; Stop agents (with stale-struct guard)
-    (condition-case _err
+    (condition-case err
         (dolist (agent (agents-workflow-agents wf))
           (pcase (agents-workflow-agent-type agent)
             ('interactive
@@ -1971,13 +1983,13 @@ Respects Slack safety rules by showing confirmation."
 ;;;; Persistence (.eld file support)
 
 (defcustom agents-workflow-projects-directory
-  (locate-user-emacs-file "agents-workflow/projects")
+  (expand-file-name "~/Documents/work/ai-work-toolkit/projects")
   "Directory containing workflow definition (.eld) files."
   :type 'directory
   :group 'agents-workflow)
 
 (defcustom agents-workflow-elisp-directory
-  (locate-user-emacs-file "agents-workflow/elisp")
+  (expand-file-name "~/Documents/work/ai-work-toolkit/elisp")
   "Directory containing elisp packages.
 Used for convention-based system prompt discovery:
 when an agent named NAME is started, the file
@@ -2107,7 +2119,7 @@ Agents present in the state file but not in the workflow definition
 (defun agents-workflow--save-all-states ()
   "Save session state for all registered workflows.
 Called automatically on Emacs exit via `kill-emacs-hook'."
-  (maphash (lambda (name _wf)
+  (maphash (lambda (name wf)
              (condition-case err
                  (progn
                    (agents-workflow-save-state name)

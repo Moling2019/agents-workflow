@@ -1,5 +1,4 @@
 ;;; claude-dashboard-tests.el --- Tests for claude-dashboard -*- lexical-binding: t; -*-
-;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Code:
 (require 'ert)

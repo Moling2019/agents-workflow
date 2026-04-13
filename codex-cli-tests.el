@@ -1,5 +1,4 @@
 ;;; codex-cli-tests.el --- Tests for codex-cli -*- lexical-binding: t; -*-
-;; SPDX-License-Identifier: GPL-3.0-or-later
 (require 'ert)
 (require 'codex-cli)
 
@@ -66,7 +65,7 @@
       (kill-buffer buf2))))
 
 (ert-deftest codex-cli-test-defcustom-defaults ()
-  "Default program and switches are sensible."
+  "Default program and switches are set."
   (should (equal codex-cli-program "codex"))
   (should (equal codex-cli-program-switches '("--dangerously-bypass-approvals-and-sandbox")))
   (should (= codex-cli-startup-delay 0.5)))
