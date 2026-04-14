@@ -10,6 +10,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 
 (declare-function magit-diff-range "magit-diff" (range &optional args files))
 (declare-function magit-call-git "magit-git" (&rest args))

@@ -12,7 +12,7 @@ PACKAGES := agents-workflow.el claude-dashboard.el codex-cli.el \
 
 TEST_FILES := agents-workflow-tests.el claude-dashboard-tests.el \
 	codex-cli-tests.el databricks-runs-tests.el slack-monitor-tests.el \
-	github-prs-tests.el
+	github-prs-tests.el integration-tests.el
 
 .PHONY: all test compile checkdoc clean
 
