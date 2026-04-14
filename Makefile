@@ -1,11 +1,11 @@
 EMACS ?= emacs
 ELPA_DIR := $(HOME)/.emacs.d/elpa
-ALL_ICONS_DIR := $(wildcard $(ELPA_DIR)/all-the-icons-*)
-NERD_ICONS_DIR := $(wildcard $(ELPA_DIR)/nerd-icons-*)
+
+# Discover dependency directories (works with any version suffix)
 LOAD_PATH := -L . \
-	-L $(ELPA_DIR)/claude-code \
-	-L $(ALL_ICONS_DIR) \
-	-L $(NERD_ICONS_DIR)
+	$(patsubst %,-L %,$(wildcard $(ELPA_DIR)/claude-code*)) \
+	$(patsubst %,-L %,$(wildcard $(ELPA_DIR)/all-the-icons-*)) \
+	$(patsubst %,-L %,$(wildcard $(ELPA_DIR)/nerd-icons-*))
 
 PACKAGES := agents-workflow.el claude-dashboard.el codex-cli.el \
 	databricks-runs.el jira-board.el slack-monitor.el github-prs.el

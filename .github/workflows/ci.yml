@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        emacs-version: ['30.1']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      - name: Install dependencies
+        run: |
+          emacs --batch --eval "
+          (progn
+            (require 'package)
+            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
+            (package-initialize)
+            (package-refresh-contents)
+            (package-install 'all-the-icons)
+            (package-vc-install \"https://github.com/stevemolitor/claude-code.el\"))"
+
+      - name: Run tests
+        run: make test
+
+      - name: Byte-compile
+        run: make compile
+
+      - name: Checkdoc
+        run: make checkdoc
