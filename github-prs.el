@@ -11,6 +11,9 @@
 
 (require 'cl-lib)
 
+(declare-function magit-diff-range "magit-diff" (range &optional args files))
+(declare-function magit-call-git "magit-git" (&rest args))
+
 (defgroup github-prs nil
   "Monitor GitHub pull requests."
   :group 'tools

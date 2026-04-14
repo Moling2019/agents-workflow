@@ -39,6 +39,7 @@
 (declare-function claude-code--term-configure "claude-code")
 (declare-function claude-code--term-setup-keymap "claude-code")
 (declare-function claude-code--term-customize-faces "claude-code")
+(declare-function eat-term-set-parameter "eat" (terminal parameter value))
 (defvar claude-code-event-hook)
 (defvar claude-code-terminal-backend)
 (defvar claude-code-program)
@@ -188,6 +189,15 @@ Returns the prompt string or nil."
   (or (plist-get plist :system-prompt)
       (agents-workflow--read-prompt-file
        (plist-get plist :system-prompt-file))))
+
+(defcustom agents-workflow-elisp-directory
+  (expand-file-name "elisp" user-emacs-directory)
+  "Directory containing elisp packages.
+Used for convention-based system prompt discovery:
+when an agent named NAME is started, the file
+<elisp-directory>/NAME/system-prompt.md is loaded automatically."
+  :type 'directory
+  :group 'agents-workflow)
 
 (defun agents-workflow--convention-system-prompt (agent-name)
   "Look up a system prompt by convention for AGENT-NAME.
@@ -437,7 +447,7 @@ sentence of the agent's last response rather than a trailing fragment."
 
 (defun agents-workflow--last-output-column-offset ()
   "Compute the character offset where the Last Output column starts.
-Sums widths and padding of all preceding columns from the agents panel definition."
+Sums widths and padding of all preceding columns."
   (let ((offset 2)  ;; leading indent
         (columns [("Agent" 16 t) ("T" 3 t) ("S" 3 nil) ("Dir" 18 nil) ("Activity" 10 nil)])
         (padding 2))
@@ -1508,8 +1518,8 @@ the agent status after it has been set to idle."
                 #'ignore)
             (args-out-of-range nil)))))))
 
-(defun agents-workflow--handle-title-change (agent buf title &optional idle-pattern)
-  "Handle a terminal title change for AGENT with buffer BUF.
+(defun agents-workflow--handle-title-change (agent _buf title &optional idle-pattern)
+  "Handle a terminal title change for AGENT with buffer _BUF.
 TITLE is the new terminal title.  IDLE-PATTERN is the string that
 indicates the CLI is idle/waiting (defaults to the global pattern)."
   (let ((pattern (or idle-pattern agents-workflow--title-idle-pattern)))
@@ -1658,7 +1668,7 @@ If the agent has a session-id, resumes that session with --resume."
 
 (defun agents-workflow--send-context-to-agent (agent workflow)
   "Send WORKFLOW's context file contents to interactive AGENT.
-Sends it as the first message after a short delay to let the terminal initialize."
+Sends as the first message after a delay for terminal init."
   (when-let ((content (agents-workflow--read-context-file workflow)))
     (let ((buf (agents-workflow-agent-buffer agent))
           (msg (format "Read and internalize this workflow context. Do NOT take any action yet, just acknowledge you've read it.\n\n%s" content)))
@@ -1714,7 +1724,8 @@ If REQUESTER-NAME is nil, just sends the question without routing the
 response back.  Returns a status message.
 
 Designed to be called from agents via emacsclient:
-  emacsclient -e \\='(agents-workflow-ask-agent \"worker\" \"What is X?\" \"slack-monitor\")\\='"
+  emacsclient -e \\='(agents-workflow-ask-agent
+    \"worker\" \"What is X?\" \"slack-monitor\")\\='"
   (let ((wf nil) (target nil))
     ;; Find the workflow and target agent
     (maphash (lambda (_name w)
@@ -1844,7 +1855,7 @@ Kills autonomous agents, cancels timers, unlinks interactive agents."
                       workflow-name (error-message-string err))))
 
     ;; Stop agents (with stale-struct guard)
-    (condition-case err
+    (condition-case _err
         (dolist (agent (agents-workflow-agents wf))
           (pcase (agents-workflow-agent-type agent)
             ('interactive
@@ -1988,15 +1999,6 @@ Respects Slack safety rules by showing confirmation."
   :type 'directory
   :group 'agents-workflow)
 
-(defcustom agents-workflow-elisp-directory
-  (expand-file-name "~/Documents/work/ai-work-toolkit/elisp")
-  "Directory containing elisp packages.
-Used for convention-based system prompt discovery:
-when an agent named NAME is started, the file
-<elisp-directory>/NAME/system-prompt.md is loaded automatically."
-  :type 'directory
-  :group 'agents-workflow)
-
 (defun agents-workflow--generate-uuid ()
   "Generate a random UUID v4 string."
   (format "%08x-%04x-4%03x-%04x-%012x"
@@ -2119,7 +2121,7 @@ Agents present in the state file but not in the workflow definition
 (defun agents-workflow--save-all-states ()
   "Save session state for all registered workflows.
 Called automatically on Emacs exit via `kill-emacs-hook'."
-  (maphash (lambda (name wf)
+  (maphash (lambda (name _wf)
              (condition-case err
                  (progn
                    (agents-workflow-save-state name)
