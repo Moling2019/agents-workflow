@@ -2,7 +2,7 @@ EMACS ?= emacs
 ELPA_DIR := $(HOME)/.emacs.d/elpa
 
 # Discover dependency directories (works with any version suffix)
-LOAD_PATH := -L . \
+LOAD_PATH := -L . -L test \
 	$(patsubst %,-L %,$(wildcard $(ELPA_DIR)/claude-code*)) \
 	$(patsubst %,-L %,$(wildcard $(ELPA_DIR)/all-the-icons-*)) \
 	$(patsubst %,-L %,$(wildcard $(ELPA_DIR)/nerd-icons-*))
@@ -10,9 +10,7 @@ LOAD_PATH := -L . \
 PACKAGES := agents-workflow.el claude-dashboard.el codex-cli.el \
 	databricks-runs.el jira-board.el slack-monitor.el github-prs.el
 
-TEST_FILES := agents-workflow-tests.el claude-dashboard-tests.el \
-	codex-cli-tests.el databricks-runs-tests.el slack-monitor-tests.el \
-	github-prs-tests.el integration-tests.el
+TEST_FILES := $(wildcard test/*-tests.el)
 
 .PHONY: all test compile checkdoc clean
 
@@ -35,4 +33,4 @@ checkdoc:
 	  $(foreach f,$(PACKAGES),--eval "(checkdoc-file \"$(f)\")")
 
 clean:
-	rm -f *.elc
+	rm -f *.elc test/*.elc
