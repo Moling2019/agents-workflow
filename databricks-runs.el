@@ -27,22 +27,25 @@
   :group 'databricks-runs)
 
 (defcustom databricks-runs-python "python3"
-  "Path to Python interpreter with the toolkit installed."
+  "Python ≥3.9 interpreter for the fetch scripts.
+The scripts use only the Python standard library, so any `python3' on
+PATH works — no venv or pip packages required."
   :type 'string
   :group 'databricks-runs)
 
 (defcustom databricks-runs-env-file nil
-  "Path to .env file with Databricks credentials."
+  "Path to .env file with Databricks credentials.
+Loaded via `set -a && source <file> && set +a' before running the
+Python fetch script.  The script reads `DATABRICKS_USERNAME' from the
+environment to filter runs to the current user."
   :type '(choice (const nil) string)
   :group 'databricks-runs)
 
 (defcustom databricks-runs-cli-profile nil
-  "Databricks CLI profile for OAuth."
-  :type '(choice (const nil) string)
-  :group 'databricks-runs)
-
-(defcustom databricks-runs-repo-dir nil
-  "Directory containing the utils.databricks_job_submit package."
+  "Databricks CLI profile for OAuth.
+Must match a section header in ~/.databrickscfg.  Tokens are fetched
+via `databricks auth token -p <profile>' so the `databricks' CLI must
+be on PATH and previously authenticated via `databricks auth login'."
   :type '(choice (const nil) string)
   :group 'databricks-runs)
 
@@ -216,31 +219,117 @@ If agent/workflow not found, logs warning and unregisters."
     ("\\([0-9]\\{10,\\}\\)$" 1 'databricks-runs-run-id))
   "Font-lock keywords for `databricks-runs-mode'.")
 
-(defun databricks-runs--python-script ()
-  "Return the Python script that fetches and prints runs."
-  (format "
-import sys, os
-sys.path.insert(0, %S)
-from utils.databricks_job_submit import list_my_runs, format_runs_table
+(defconst databricks-runs--fetch-preamble "
+import os, json, subprocess, configparser, urllib.request, urllib.parse
 from datetime import datetime
-runs = list_my_runs(active_only=False, cli_profile=%S)
-now = datetime.now().strftime('%%Y-%%m-%%d %%H:%%M:%%S')
-print(f'Databricks Runs  |  {now}  |  refresh: %ds  |  g=refresh  q=quit')
+from pathlib import Path
+
+PROFILE = %S
+
+def _token():
+    r = subprocess.run(['databricks', 'auth', 'token', '-p', PROFILE],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise SystemExit(f'databricks auth failed: {r.stderr.strip()}')
+    return json.loads(r.stdout)['access_token']
+
+def _host():
+    cfg = configparser.ConfigParser()
+    cfg.read(Path.home() / '.databrickscfg')
+    if PROFILE not in cfg or 'host' not in cfg[PROFILE]:
+        raise SystemExit(f'profile {PROFILE!r} missing host in ~/.databrickscfg')
+    return cfg[PROFILE]['host'].rstrip('/')
+
+def _list_runs():
+    token, host = _token(), _host()
+    url = host + '/api/2.1/jobs/runs/list'
+    all_runs, page = [], None
+    for _ in range(10):
+        params = {'limit': 25, 'active_only': 'false'}
+        if page:
+            params['page_token'] = page
+        req = urllib.request.Request(
+            url + '?' + urllib.parse.urlencode(params),
+            headers={'Authorization': 'Bearer ' + token})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        all_runs.extend(data.get('runs', []))
+        page = data.get('next_page_token')
+        if not page:
+            break
+    username = os.environ.get('DATABRICKS_USERNAME')
+    if username:
+        all_runs = [r for r in all_runs if r.get('creator_user_name') == username]
+    return all_runs
+"
+  "Shared Python preamble: stdlib-only token/host/runs helpers.
+Defines PROFILE, _token(), _host(), _list_runs().  The `%%S' format
+placeholder is filled with `databricks-runs-cli-profile'.")
+
+(defun databricks-runs--python-script ()
+  "Return the Python script that fetches and prints runs.
+Used by the standalone `*Databricks Runs*' buffer."
+  (concat
+   (format databricks-runs--fetch-preamble databricks-runs-cli-profile)
+   (format "
+
+def _fmt_duration(ms):
+    if ms <= 0: return '-'
+    total = ms // 1000
+    if total < 60: return f'{total}s'
+    m, s = divmod(total, 60)
+    if m < 60: return f'{m}m {s:02d}s'
+    h, m = divmod(m, 60)
+    return f'{h}h {m:02d}m'
+
+_STATE_MAP = {
+    ('RUNNING', ''): 'RUNNING', ('PENDING', ''): 'PENDING',
+    ('TERMINATED', 'SUCCESS'): 'SUCCESS', ('TERMINATED', 'FAILED'): 'FAILED',
+    ('TERMINATED', 'CANCELED'): 'CANCELED', ('TERMINATING', ''): 'STOPPING',
+    ('SKIPPED', ''): 'SKIPPED', ('INTERNAL_ERROR', ''): 'ERROR',
+    ('INTERNAL_ERROR', 'FAILED'): 'ERROR',
+}
+
+def _fmt_state(run):
+    st = run.get('state', {})
+    lc, rs = st.get('life_cycle_state', '?'), st.get('result_state', '')
+    return _STATE_MAP.get((lc, rs), f'{lc}/{rs}' if rs else lc)
+
+def _fmt_table(runs):
+    if not runs: return '  No runs found.'
+    header = f'  {\"State\":<12} {\"Run Name\":<44} {\"Started\":<18} {\"Duration\":<10} Run ID'
+    lines = [header, '  ' + '-' * (len(header) - 2)]
+    now_ms = int(datetime.now().timestamp() * 1000)
+    for r in runs:
+        name = r.get('run_name', 'unnamed')
+        if len(name) > 43: name = name[:40] + '...'
+        start_ms = r.get('start_time', 0)
+        started = (datetime.fromtimestamp(start_ms / 1000).strftime('%%b %%d %%H:%%M')
+                   if start_ms else '-')
+        end_ms = r.get('end_time', 0)
+        if end_ms and start_ms: dur = _fmt_duration(end_ms - start_ms)
+        elif start_ms:          dur = _fmt_duration(now_ms - start_ms)
+        else:                   dur = '-'
+        lines.append(f'  {_fmt_state(r):<12} {name:<44} {started:<18} {dur:<10} {r.get(\"run_id\", \"?\")}')
+    return '\\n'.join(lines)
+
+_runs = _list_runs()
+_now = datetime.now().strftime('%%Y-%%m-%%d %%H:%%M:%%S')
+print(f'Databricks Runs  |  {_now}  |  refresh: %ds  |  g=refresh  q=quit')
 print()
-print(format_runs_table(runs))
-" databricks-runs-repo-dir
-  databricks-runs-cli-profile
-  databricks-runs-refresh-interval))
+print(_fmt_table(_runs))
+" databricks-runs-refresh-interval)))
 
 (defun databricks-runs--json-python-script ()
-  "Return a Python script that fetches runs and outputs JSON."
-  (format "
-import sys, os, json
-sys.path.insert(0, %S)
-from utils.databricks_job_submit import list_my_runs
-runs = list_my_runs(active_only=False, cli_profile=%S)
+  "Return a Python script that fetches runs and outputs JSON.
+Used by the dashboard panel.  Output is a JSON array of objects with
+keys: run_id, run_name, state, result_state, start_time, end_time,
+run_page_url."
+  (concat
+   (format databricks-runs--fetch-preamble databricks-runs-cli-profile)
+   "
 out = []
-for r in runs:
+for r in _list_runs():
     out.append({
         'run_id': str(r.get('run_id', '')),
         'run_name': r.get('run_name', ''),
@@ -248,11 +337,10 @@ for r in runs:
         'result_state': r.get('state', {}).get('result_state', ''),
         'start_time': r.get('start_time', 0),
         'end_time': r.get('end_time', 0),
-        'run_page_url': r.get('run_page_url', '')
+        'run_page_url': r.get('run_page_url', ''),
     })
 print(json.dumps(out))
-" databricks-runs-repo-dir
-  databricks-runs-cli-profile))
+"))
 
 (defvar-local databricks-runs--cache nil
   "Cached JSON run data for panel entries.")
@@ -297,7 +385,7 @@ print(json.dumps(out))
 
 (defun databricks-runs--env-shell-prefix ()
   "Return shell command prefix that sources the .env file."
-  (if (file-exists-p databricks-runs-env-file)
+  (if (and databricks-runs-env-file (file-exists-p databricks-runs-env-file))
       (format "set -a && source %s && set +a && "
               (shell-quote-argument databricks-runs-env-file))
     ""))

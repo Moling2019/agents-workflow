@@ -103,7 +103,7 @@ print(json.dumps(issues))
 
 (defun jira-board--env-shell-prefix ()
   "Return shell command prefix that sources the .env file."
-  (if (file-exists-p jira-board-env-file)
+  (if (and jira-board-env-file (file-exists-p jira-board-env-file))
       (format "set -a && source %s && set +a && "
               (shell-quote-argument jira-board-env-file))
     ""))
