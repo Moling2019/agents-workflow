@@ -171,6 +171,34 @@ Each panel has its own `defcustom` variables for configuration:
 - **slack-monitor** -- `slack-monitor-cache-file`, `slack-monitor-ignore-file`
 - **github-prs** -- `github-prs-author`, `github-prs-state`, `github-prs-limit`, `github-prs-refresh-interval`, `github-prs-enrich`, `github-prs-gh-program`
 
+### Personalization vs. package defaults
+
+This package ships with **generic defaults** -- most panel variables default to
+`nil` or a neutral value like `"python3"` because they refer to site-specific
+resources (an internal Atlassian tenant, a Databricks CLI profile, a Python
+venv that has the right libs installed, a `.env` file with credentials).
+
+Every user must set these in their own init file. If a panel shows "Wrong type
+argument: stringp, nil" on refresh, one of its required variables is unset.
+
+Example `use-package` block (adapt paths for your setup):
+
+```elisp
+(use-package jira-board
+  :custom
+  (jira-board-python    "~/my-project/.venv/bin/python") ; needs `requests`
+  (jira-board-env-file  "~/my-project/.env")             ; JIRA_EMAIL + JIRA_API_TOKEN
+  (jira-board-site      "yourcompany.atlassian.net")
+  (jira-board-project   "PROJ"))
+
+(use-package databricks-runs
+  :custom
+  (databricks-runs-python      "~/my-project/.venv/bin/python") ; with databricks SDK
+  (databricks-runs-env-file    "~/my-project/.env")
+  (databricks-runs-cli-profile "your-databricks-profile")       ; from ~/.databrickscfg
+  (databricks-runs-repo-dir    "~/my-project"))                 ; where utils.databricks_job_submit lives
+```
+
 ## Architecture
 
 ```
