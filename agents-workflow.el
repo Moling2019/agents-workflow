@@ -1564,6 +1564,7 @@ indicates the CLI is idle/waiting (defaults to the global pattern)."
   "Start interactive AGENT by creating a claude-code.el eat terminal.
 Uses the agent name as the instance name, bypassing the interactive prompt.
 If the agent has a session-id, resumes that session with --resume."
+  (require 'claude-code)
   (let* ((dir (agents-workflow-agent-directory agent))
          (default-directory dir)
          (instance-name (agents-workflow-agent-name agent))
@@ -1813,8 +1814,9 @@ Launches agents, registers hooks, opens dashboard."
     ;; Ensure claude-code is loaded before starting agents
     (require 'claude-code)
 
-    ;; Register hooks
-    (add-hook 'claude-code-event-hook #'agents-workflow--handle-claude-event)
+    ;; Register hooks/advice. `claude-code-event-hook` is registered at load
+    ;; time (see end of file) so Stop-hook payloads still land in `last-output`
+    ;; when no workflow is running.
     (advice-add 'claude-code--do-send-command :filter-return
                 #'agents-workflow--handle-send-command)
     (advice-add 'claude-code--notify :after
@@ -1883,7 +1885,8 @@ Kills autonomous agents, cancels timers, unlinks interactive agents."
                      (error nil))))
                agents-workflow--registry)
       (unless any-running
-        (remove-hook 'claude-code-event-hook #'agents-workflow--handle-claude-event)
+        ;; Keep `claude-code-event-hook` registered — see load-time
+        ;; registration at end of file.
         (advice-remove 'claude-code--do-send-command
                        #'agents-workflow--handle-send-command)
         (advice-remove 'claude-code--notify
@@ -2257,6 +2260,12 @@ If FILE is nil, save to `agents-workflow-projects-directory'/NAME.eld."
       :agents agents
       :triggers triggers
       :panels panels)
+    ;; Also restore saved session-ids so dashboard relaunches can --resume
+    (when (file-exists-p (agents-workflow--state-file name))
+      (condition-case err
+          (agents-workflow-load-state name)
+        (error (message "Warning: could not load state for %s: %s"
+                        name (error-message-string err)))))
     (message "Loaded workflow %s from %s" name file)
     name))
 
@@ -2317,6 +2326,13 @@ For autonomous agents, enqueues it as a background task."
   (if after-init-time
       (agents-workflow--auto-load)
     (add-hook 'after-init-hook #'agents-workflow--auto-load)))
+
+;; Register event handler at load time. It's a pure function that no-ops
+;; when it can't find a matching agent, so leaving it installed when no
+;; workflow is running is safe. Registering only at workflow-start caused
+;; stop-hook payloads (Last Output) to be dropped between runs.
+(with-eval-after-load 'claude-code
+  (add-hook 'claude-code-event-hook #'agents-workflow--handle-claude-event))
 
 (provide 'agents-workflow)
 ;;; agents-workflow.el ends here
