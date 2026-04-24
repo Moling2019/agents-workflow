@@ -310,8 +310,12 @@ Erases buffer and re-renders from scratch."
   "Refresh all panels in the current dashboard buffer."
   (interactive)
   (when claude-dashboard--panels
-    (let ((saved-row-id (get-text-property (point) 'dashboard-row-id))
-          (saved-panel (get-text-property (point) 'dashboard-panel)))
+    (let* ((saved-row-id (get-text-property (point) 'dashboard-row-id))
+           (saved-panel (get-text-property (point) 'dashboard-panel))
+           (saved-line (line-number-at-pos (point)))
+           (win (get-buffer-window (current-buffer)))
+           (saved-win-line (when win
+                             (line-number-at-pos (window-start win)))))
       ;; Advance spinner
       (setq claude-dashboard--spinner-index
             (1+ claude-dashboard--spinner-index))
@@ -320,16 +324,20 @@ Erases buffer and re-renders from scratch."
         (setq header-line-format (funcall claude-dashboard--header-fn)))
       ;; Re-render
       (claude-dashboard--render-all)
-      ;; Restore cursor
+      ;; Restore cursor — try row-id first, fall back to line number
       (cond
-       ;; Try to stay on same row
        ((and saved-row-id (claude-dashboard--goto-row saved-row-id)))
-       ;; Fall back to first row of same panel
        ((and saved-panel
              (claude-dashboard--goto-first-row-of-panel
               (claude-dashboard--find-panel saved-panel))))
-       ;; Fall back to first data row
-       (t (claude-dashboard--goto-first-data-row))))))
+       (t (goto-char (point-min))
+          (forward-line (1- saved-line))))
+      ;; Restore window scroll position by line number
+      (when (and win saved-win-line)
+        (save-excursion
+          (goto-char (point-min))
+          (forward-line (1- saved-win-line))
+          (set-window-start win (point) t))))))
 
 (defun claude-dashboard--refresh-panel (buf panel)
   "Refresh a single PANEL section within dashboard BUF.
@@ -337,9 +345,18 @@ Called by per-panel timers.  Re-renders only the affected section."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (let* ((panel-name (plist-get panel :name))
-             (saved-row-id (get-text-property (point) 'dashboard-row-id))
-             (saved-panel (get-text-property (point) 'dashboard-panel))
-             (window-width (max 80 (window-width))))
+             (win (get-buffer-window buf))
+             ;; Save window state (separate from buffer point in timers)
+             (saved-win-point (when win (window-point win)))
+             (saved-win-start (when win (window-start win)))
+             (saved-row-id (when saved-win-point
+                             (get-text-property saved-win-point
+                                                'dashboard-row-id)))
+             (saved-line (when saved-win-point
+                           (line-number-at-pos saved-win-point)))
+             (saved-win-start-line (when saved-win-start
+                                     (line-number-at-pos saved-win-start)))
+             (window-width (max 80 (if win (window-width win) 80))))
         ;; Advance spinner
         (setq claude-dashboard--spinner-index (1+ claude-dashboard--spinner-index))
         ;; Call :refresh if present
@@ -352,7 +369,6 @@ Called by per-panel timers.  Re-renders only the affected section."
         (let ((start nil) (end nil))
           (save-excursion
             (goto-char (point-min))
-            ;; Find first data row (has panel name but NOT section-header)
             (while (and (not start) (not (eobp)))
               (when (and (equal (get-text-property (point) 'dashboard-panel) panel-name)
                          (not (get-text-property (point) 'dashboard-section-header))
@@ -366,26 +382,21 @@ Called by per-panel timers.  Re-renders only the affected section."
                           (not (get-text-property (point) 'dashboard-section-header)))
                 (forward-line 1))
               (setq end (point))))
-          ;; If no data rows found, find insertion point after section header
           (unless start
             (save-excursion
               (goto-char (point-min))
               (while (not (eobp))
                 (when (and (equal (get-text-property (point) 'dashboard-panel) panel-name)
                            (get-text-property (point) 'dashboard-section-header))
-                  ;; Advance past section header lines
                   (while (and (not (eobp))
                               (get-text-property (point) 'dashboard-section-header))
                     (forward-line 1))
                   (setq start (point) end (point)))
                 (forward-line 1))))
-          ;; Save a marker when cursor is on a different panel so we can
-          ;; restore it after the delete+insert cycle (which moves point).
-          (let ((restore-marker (unless (equal saved-panel panel-name)
-                                  (copy-marker (point)))))
-            ;; Re-render data rows in place (section header + column headers untouched)
-            (when (and start end)
-              (let ((inhibit-read-only t))
+          ;; Re-render data rows
+          (when (and start end)
+            (let ((inhibit-read-only t))
+              (save-excursion
                 (goto-char start)
                 (delete-region start end)
                 (let* ((columns (plist-get panel :columns))
@@ -405,15 +416,29 @@ Called by per-panel timers.  Re-renders only the affected section."
                       (let ((s (point)))
                         (insert line "\n")
                         (put-text-property s (point) 'dashboard-panel panel-name)
-                        (put-text-property s (point) 'dashboard-row-id row-id)))))))
-            ;; Restore cursor
-            (cond
-             (restore-marker
-              (goto-char restore-marker)
-              (set-marker restore-marker nil))
-             (t
-              (or (claude-dashboard--goto-row saved-row-id)
-                  (claude-dashboard--goto-first-row-of-panel panel))))))))))
+                        (put-text-property s (point) 'dashboard-row-id row-id))))))))
+          ;; Restore window point and scroll position
+          (when win
+            ;; Restore point: try row-id, fall back to line number
+            (let ((new-point
+                   (or (and saved-row-id
+                            (save-excursion
+                              (when (claude-dashboard--goto-row saved-row-id)
+                                (point))))
+                       (when saved-line
+                         (save-excursion
+                           (goto-char (point-min))
+                           (forward-line (1- saved-line))
+                           (point))))))
+              (when new-point
+                (set-window-point win new-point)))
+            ;; Restore scroll position by line number
+            (when saved-win-start-line
+              (save-excursion
+                (goto-char (point-min))
+                (forward-line (1- saved-win-start-line))
+                (set-window-start win (point) t)))))))))
+
 
 ;;;; Context-Sensitive Mode-Line
 
