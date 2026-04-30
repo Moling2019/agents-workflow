@@ -101,11 +101,46 @@ to manage the workflow.
 
 ### Keybindings (dashboard buffer)
 
-| Key   | Command                         | Description                |
-|-------|---------------------------------|----------------------------|
-| `g`   | revert-buffer                   | Refresh dashboard          |
-| `q`   | quit-window                     | Close dashboard            |
-| `RET` | (on agent row)                  | Switch to agent buffer     |
+| Key       | Command                         | Description                                    |
+|-----------|---------------------------------|------------------------------------------------|
+| `g`       | revert-buffer                   | Refresh dashboard                              |
+| `q`       | quit-window                     | Close dashboard                                |
+| `RET`     | (on agent row)                  | Switch to agent buffer                         |
+| `s`       | (on agent row)                  | Send a command to the agent                    |
+| `a`       | (anywhere in agents panel)      | Add and start a new agent                      |
+| `R`       | (on agent row)                  | Rename agent                                   |
+| `d`       | (on agent row)                  | Delete agent                                   |
+| `i`       | (on agent row)                  | Add an extra `--add-dir` directory             |
+| `c`       | (on agent row)                  | **Fork** — clone the session, share worktree   |
+| `C-k C-k` | (on agent row)                  | Kill agent process (keep dashboard entry)      |
+
+### Forking an agent (`c`)
+
+`c` on an interactive agent row creates a sibling agent named
+`<original>-fork-N` whose Claude Code session is a copy of the source
+session at the moment of forking. After the fork point both sessions
+diverge — like a git branch.
+
+How it works under the hood:
+
+1. The source agent's session transcript at
+   `~/.claude/projects/<encoded-path>/<src-uuid>.jsonl` is copied to
+   `<new-uuid>.jsonl`, with each line's inline `sessionId` field rewritten
+   to the new UUID so `claude --resume` picks up the cloned conversation.
+2. The sibling per-session dir (`tool-results/`) is copied alongside.
+3. A new agent is added to the workflow with the new `:session-id`, the
+   same `:directory`, and the same `:worktree-path` as the source — both
+   forks share the same files on disk.
+
+Caveats:
+
+- The source agent must have been started at least once (it needs a
+  session-id). Forking an `idle`-from-creation agent fails with a clear
+  error.
+- Forks share a worktree, so simultaneous edits can collide. If you want
+  isolation, kill one fork before letting the other modify files.
+- Only `interactive` agents can be forked (autonomous polling agents
+  don't have a meaningful "branch point").
 
 ### Commands
 

@@ -605,7 +605,9 @@ For use with `claude-dashboard-create'."
                 ("C-o" . ,(lambda (_panel row-id)
                             (agents-workflow--panel-toggle-expand wf-name row-id)))
                 ("C-k C-k" . ,(lambda (_panel row-id)
-                                (agents-workflow--panel-kill-agent wf-name row-id))))
+                                (agents-workflow--panel-kill-agent wf-name row-id)))
+                ("c" . ,(lambda (_panel row-id)
+                          (agents-workflow--panel-fork-agent wf-name row-id))))
      :interval 3
      :context wf-name)))
 
@@ -885,6 +887,78 @@ the user chose to use the base directory directly."
           (message "Added and started %s agent %s%s"
                    backend-str name
                    (if wt-path (format " (worktree: %s)" (file-name-nondirectory (directory-file-name wt-path))) "")))))))
+
+(defun agents-workflow--encode-project-path (path)
+  "Encode PATH the way Claude Code stores it under ~/.claude/projects/.
+Replaces both \"/\" and \".\" with \"-\".  E.g. /Users/foo.bar/baz ->
+-Users-foo-bar-baz, matching Claude Code's filesystem-safe scheme."
+  (replace-regexp-in-string "[/.]" "-" (expand-file-name path)))
+
+(defun agents-workflow--clone-session-files (old-id new-id project-dir)
+  "Copy Claude Code session OLD-ID's transcript + tool-results to NEW-ID.
+PROJECT-DIR is the agent's working directory (used to derive the
+~/.claude/projects/<encoded>/ path).  Rewrites the inline `sessionId'
+field on each JSONL line so Claude Code's --resume picks up the new id.
+Returns the new transcript path, or signals an error if the source
+transcript is missing."
+  (let* ((projects-root (expand-file-name "~/.claude/projects"))
+         (encoded (agents-workflow--encode-project-path project-dir))
+         (project-path (expand-file-name encoded projects-root))
+         (old-jsonl (expand-file-name (concat old-id ".jsonl") project-path))
+         (new-jsonl (expand-file-name (concat new-id ".jsonl") project-path))
+         (old-dir (expand-file-name old-id project-path))
+         (new-dir (expand-file-name new-id project-path)))
+    (unless (file-exists-p old-jsonl)
+      (error "Cannot fork: transcript %s not found" old-jsonl))
+    ;; Rewrite sessionId field on each line as we copy
+    (with-temp-buffer
+      (insert-file-contents old-jsonl)
+      (goto-char (point-min))
+      (while (re-search-forward (format "\"sessionId\":\"%s\"" (regexp-quote old-id)) nil t)
+        (replace-match (format "\"sessionId\":\"%s\"" new-id) t t))
+      (write-region (point-min) (point-max) new-jsonl))
+    ;; Copy sibling per-session dir (tool-results) if it exists
+    (when (file-directory-p old-dir)
+      (copy-directory old-dir new-dir t t t))
+    new-jsonl))
+
+(defun agents-workflow--panel-fork-agent (wf-name row-id)
+  "Fork agent ROW-ID in workflow WF-NAME (clone session, share worktree).
+Creates a sibling agent named <ROW-ID>-fork-N with a copy of the source
+session's Claude Code transcript, then starts it in the same directory."
+  (when-let* ((wf (agents-workflow--get wf-name))
+              (src (agents-workflow--find-agent-by-name wf row-id)))
+    (unless (eq (agents-workflow-agent-type src) 'interactive)
+      (user-error "Fork only supported for interactive agents"))
+    (let ((src-id (agents-workflow-agent-session-id src)))
+      (unless src-id
+        (user-error "Source agent has no session-id yet — start it first"))
+      ;; Pick the next free fork-N name
+      (let* ((existing (mapcar #'agents-workflow-agent-name
+                               (agents-workflow-agents wf)))
+             (n 1)
+             (fork-name (format "%s-fork-%d" row-id n)))
+        (while (member fork-name existing)
+          (setq n (1+ n)
+                fork-name (format "%s-fork-%d" row-id n)))
+        (let* ((new-id (agents-workflow--generate-uuid))
+               (dir (agents-workflow-agent-directory src)))
+          (agents-workflow--clone-session-files src-id new-id dir)
+          (let ((agent (make-agents-workflow-agent
+                        :name fork-name
+                        :type 'interactive
+                        :backend (agents-workflow-agent-backend src)
+                        :status 'idle
+                        :directory dir
+                        :session-id new-id
+                        :worktree-path (agents-workflow-agent-worktree-path src)
+                        :extra-directories (agents-workflow-agent-extra-directories src))))
+            (setf (agents-workflow-agents wf)
+                  (append (agents-workflow-agents wf) (list agent)))
+            (agents-workflow--start-agent agent wf)
+            (claude-dashboard-refresh-all)
+            (message "Forked %s -> %s (session %s)"
+                     row-id fork-name (substring new-id 0 8))))))))
 
 (defun agents-workflow--restart-agent-with-dirs (agent workflow)
   "Kill and restart AGENT, preserving session-id with updated --add-dir flags."
@@ -2011,10 +2085,17 @@ Respects Slack safety rules by showing confirmation."
           (logior #x8000 (random #x3fff))
           (random (expt 16 12))))
 
+(defun agents-workflow--workflow-directory (workflow-name)
+  "Return the per-workflow subdirectory under the projects directory.
+Each workflow lives in its own subdirectory under
+`agents-workflow-projects-directory', co-located with notes/knowledge."
+  (expand-file-name workflow-name agents-workflow-projects-directory))
+
 (defun agents-workflow--state-file (workflow-name)
-  "Return the state file path for WORKFLOW-NAME."
+  "Return the state file path for WORKFLOW-NAME.
+Stored inside the workflow's own subdirectory."
   (expand-file-name (concat "." workflow-name "-state.eld")
-                    agents-workflow-projects-directory))
+                    (agents-workflow--workflow-directory workflow-name)))
 
 (defun agents-workflow-save-state (&optional workflow-name)
   "Save session state for WORKFLOW-NAME.
@@ -2225,8 +2306,9 @@ If FILE is nil, save to `agents-workflow-projects-directory'/NAME.eld."
                           (hash-table-keys agents-workflow--registry) nil t)))
   (let* ((wf (agents-workflow--get workflow-name))
          (file (or file
-                   (expand-file-name (concat workflow-name ".eld")
-                                     agents-workflow-projects-directory)))
+                   (expand-file-name
+                    (concat workflow-name ".eld")
+                    (agents-workflow--workflow-directory workflow-name))))
          (data (agents-workflow--serialize wf))
          (dir (file-name-directory file)))
     (unless wf (error "No workflow named %s" workflow-name))
@@ -2271,12 +2353,27 @@ If FILE is nil, save to `agents-workflow-projects-directory'/NAME.eld."
 
 (defun agents-workflow-load-directory (&optional directory)
   "Load all .eld workflow files from DIRECTORY.
-Defaults to `agents-workflow-projects-directory'."
+Defaults to `agents-workflow-projects-directory'.
+
+Workflows are organized as
+`<projects-directory>/<workflow-name>/<workflow-name>.eld'.
+This function loads `.eld' files one level deep into immediate
+subdirectories. Top-level `.eld' files are also loaded for backward
+compatibility, but new workflows should live inside their own
+subdirectory so that workflow notes/knowledge can be co-located."
   (interactive)
   (let* ((dir (or directory agents-workflow-projects-directory))
-         (files (cl-remove-if
-                 (lambda (f) (string-match-p "-state\\.eld\\'" f))
-                 (directory-files dir t "\\.eld\\'")))
+         (top-level
+          (cl-remove-if
+           (lambda (f) (string-match-p "-state\\.eld\\'" f))
+           (directory-files dir t "\\.eld\\'")))
+         (subdir-eld
+          (cl-loop for entry in (directory-files dir t directory-files-no-dot-files-regexp)
+                   when (file-directory-p entry)
+                   append (cl-remove-if
+                           (lambda (f) (string-match-p "-state\\.eld\\'" f))
+                           (directory-files entry t "\\.eld\\'"))))
+         (files (append top-level subdir-eld))
          (loaded nil))
     (dolist (file files)
       (condition-case err
