@@ -933,32 +933,39 @@ session's Claude Code transcript, then starts it in the same directory."
     (let ((src-id (agents-workflow-agent-session-id src)))
       (unless src-id
         (user-error "Source agent has no session-id yet — start it first"))
-      ;; Pick the next free fork-N name
+      ;; Default to the next free fork-N name; let the user override.
       (let* ((existing (mapcar #'agents-workflow-agent-name
                                (agents-workflow-agents wf)))
              (n 1)
-             (fork-name (format "%s-fork-%d" row-id n)))
-        (while (member fork-name existing)
+             (default-name (format "%s-fork-%d" row-id n)))
+        (while (member default-name existing)
           (setq n (1+ n)
-                fork-name (format "%s-fork-%d" row-id n)))
-        (let* ((new-id (agents-workflow--generate-uuid))
-               (dir (agents-workflow-agent-directory src)))
-          (agents-workflow--clone-session-files src-id new-id dir)
-          (let ((agent (make-agents-workflow-agent
-                        :name fork-name
-                        :type 'interactive
-                        :backend (agents-workflow-agent-backend src)
-                        :status 'idle
-                        :directory dir
-                        :session-id new-id
-                        :worktree-path (agents-workflow-agent-worktree-path src)
-                        :extra-directories (agents-workflow-agent-extra-directories src))))
-            (setf (agents-workflow-agents wf)
-                  (append (agents-workflow-agents wf) (list agent)))
-            (agents-workflow--start-agent agent wf)
-            (claude-dashboard-refresh-all)
-            (message "Forked %s -> %s (session %s)"
-                     row-id fork-name (substring new-id 0 8))))))))
+                default-name (format "%s-fork-%d" row-id n)))
+        (let ((fork-name (read-string
+                          (format "Fork name (default %s): " default-name)
+                          nil nil default-name)))
+          (when (string-empty-p fork-name)
+            (setq fork-name default-name))
+          (when (member fork-name existing)
+            (user-error "Agent %s already exists" fork-name))
+          (let* ((new-id (agents-workflow--generate-uuid))
+                 (dir (agents-workflow-agent-directory src)))
+            (agents-workflow--clone-session-files src-id new-id dir)
+            (let ((agent (make-agents-workflow-agent
+                          :name fork-name
+                          :type 'interactive
+                          :backend (agents-workflow-agent-backend src)
+                          :status 'idle
+                          :directory dir
+                          :session-id new-id
+                          :worktree-path (agents-workflow-agent-worktree-path src)
+                          :extra-directories (agents-workflow-agent-extra-directories src))))
+              (setf (agents-workflow-agents wf)
+                    (append (agents-workflow-agents wf) (list agent)))
+              (agents-workflow--start-agent agent wf)
+              (claude-dashboard-refresh-all)
+              (message "Forked %s -> %s (session %s)"
+                       row-id fork-name (substring new-id 0 8)))))))))
 
 (defun agents-workflow--restart-agent-with-dirs (agent workflow)
   "Kill and restart AGENT, preserving session-id with updated --add-dir flags."

@@ -116,10 +116,13 @@ to manage the workflow.
 
 ### Forking an agent (`c`)
 
-`c` on an interactive agent row creates a sibling agent named
-`<original>-fork-N` whose Claude Code session is a copy of the source
-session at the moment of forking. After the fork point both sessions
-diverge — like a git branch.
+`c` on an interactive agent row creates a sibling agent whose Claude
+Code session is a copy of the source session at the moment of forking.
+After the fork point both sessions diverge — like a git branch.
+
+You'll be prompted for the fork's name. The default is
+`<original>-fork-N` (auto-incrementing); just press RET to accept, or
+type a custom name (e.g. `try-rewrite`, `experiment-v2`) to override.
 
 How it works under the hood:
 
