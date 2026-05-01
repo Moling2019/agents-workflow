@@ -890,9 +890,10 @@ the user chose to use the base directory directly."
 
 (defun agents-workflow--encode-project-path (path)
   "Encode PATH the way Claude Code stores it under ~/.claude/projects/.
-Replaces both \"/\" and \".\" with \"-\".  E.g. /Users/foo.bar/baz ->
--Users-foo-bar-baz, matching Claude Code's filesystem-safe scheme."
-  (replace-regexp-in-string "[/.]" "-" (expand-file-name path)))
+Replaces \"/\", \".\", and \"_\" with \"-\".  E.g.
+/Users/foo.bar/baz_qux -> -Users-foo-bar-baz-qux, matching Claude
+Code's filesystem-safe scheme."
+  (replace-regexp-in-string "[/._]" "-" (expand-file-name path)))
 
 (defun agents-workflow--clone-session-files (old-id new-id project-dir)
   "Copy Claude Code session OLD-ID's transcript + tool-results to NEW-ID.
