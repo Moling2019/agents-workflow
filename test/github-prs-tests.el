@@ -132,23 +132,27 @@
 
 (ert-deftest github-prs-test-panel-entries-with-data ()
   "Populated cache returns formatted entries."
-  (with-temp-buffer
-    (setq-local github-prs--cache
-                [((repository . "owner/my-repo")
-                  (number . 123)
-                  (title . "Fix bug")
-                  (updatedAt . "2026-03-27T00:00:00Z")
-                  (url . "https://github.com/owner/my-repo/pull/123")
-                  (isDraft . :json-false)
-                  (commentsCount . 2))])
-    (setq-local github-prs--enrichments (make-hash-table :test #'equal))
-    (let ((entries (github-prs--panel-entries)))
-      (should (= 1 (length entries)))
-      (let* ((entry (car entries))
-             (row (cadr entry)))
-        (should (equal "my-repo" (aref row 0)))
-        (should (equal "#123" (aref row 1)))
-        (should (equal "Fix bug" (aref row 2)))))))
+  ;; Disable the age filter for deterministic results — the fixture's
+  ;; updatedAt date would otherwise drift out of the default 30-day window
+  ;; and break this test 30 days after every fresh build.
+  (let ((github-prs-max-age-days 0))
+    (with-temp-buffer
+      (setq-local github-prs--cache
+                  [((repository . "owner/my-repo")
+                    (number . 123)
+                    (title . "Fix bug")
+                    (updatedAt . "2026-03-27T00:00:00Z")
+                    (url . "https://github.com/owner/my-repo/pull/123")
+                    (isDraft . :json-false)
+                    (commentsCount . 2))])
+      (setq-local github-prs--enrichments (make-hash-table :test #'equal))
+      (let ((entries (github-prs--panel-entries)))
+        (should (= 1 (length entries)))
+        (let* ((entry (car entries))
+               (row (cadr entry)))
+          (should (equal "my-repo" (aref row 0)))
+          (should (equal "#123" (aref row 1)))
+          (should (equal "Fix bug" (aref row 2))))))))
 
 ;;; --- enrichment merge ---
 
