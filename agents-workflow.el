@@ -611,18 +611,110 @@ For use with `claude-dashboard-create'."
      :interval 3
      :context wf-name)))
 
-(defun agents-workflow--persist-workflow (wf-name)
-  "Persist WF-NAME's definition (.eld) and session state (.state.eld) to disk.
-Logs a warning on failure rather than signalling, so callers in the
-panel-action path don't leave the dashboard half-updated when a save
-fails (e.g. read-only filesystem)."
-  (condition-case err
-      (progn
-        (agents-workflow-save wf-name)
-        (agents-workflow-save-state wf-name))
-    (error
-     (message "Warning: workflow %s mutated in memory but save failed: %s"
-              wf-name (error-message-string err)))))
+(defcustom agents-workflow-side-panel-width 40
+  "Column width for the always-visible side dashboard."
+  :type 'integer
+  :group 'agents-workflow)
+
+(defvar agents-workflow--side-buffer-name "*claude-dashboard:side*"
+  "Single buffer name reused by the side dashboard.")
+
+(defvar agents-workflow--side-current-wf nil
+  "Workflow name currently displayed in the side dashboard.")
+
+(defun agents-workflow-agents-panel-compact (workflow)
+  "Slim agents panel for use in a narrow side window.
+Drops Type / Dir / Activity columns; keeps Name + Status + Last Output."
+  (let ((wf-name (agents-workflow-name workflow)))
+    (list
+     :name "agents"
+     :title "Agents"
+     :columns [("Agent" 14 t) ("S" 3 nil) ("Last Output" 0 nil)]
+     :entries (lambda ()
+                (when-let ((wf (agents-workflow--get wf-name)))
+                  ;; --dashboard-entries returns (id [Agent T S Dir Activity LastOutput])
+                  ;; Pull just (id [Agent S LastOutput]) for the compact view.
+                  (mapcar (lambda (e)
+                            (let* ((id (car e))
+                                   (full (cadr e)))
+                              (cons id (vector (aref full 0)
+                                               (aref full 2)
+                                               (aref full 5)))))
+                          (agents-workflow--dashboard-entries wf))))
+     ;; Same actions as the full panel — small set is plenty for a side view.
+     :actions `(("RET" . ,(lambda (_panel row-id)
+                            (agents-workflow--panel-visit-agent wf-name row-id)))
+                ("s" . ,(lambda (_panel row-id)
+                          (agents-workflow--panel-send-command wf-name row-id)))
+                ("c" . ,(lambda (_panel row-id)
+                          (agents-workflow--panel-fork-agent wf-name row-id))))
+     :interval 3
+     :context wf-name)))
+
+(defun agents-workflow--side-display-buffer (buf)
+  "Display BUF in a sticky left side window of `agents-workflow-side-panel-width'."
+  (display-buffer
+   buf
+   `((display-buffer-in-side-window)
+     (side . left)
+     (slot . 0)
+     (window-width . ,agents-workflow-side-panel-width)
+     (window-parameters
+      ;; Stick around through C-x 1 and don't get cycled into by C-x o.
+      (no-delete-other-windows . t)
+      (no-other-window . t)
+      (mode-line-format . none)))))
+
+(defun agents-workflow-side-dashboard (&optional workflow-name)
+  "Open the always-visible compact side dashboard for WORKFLOW-NAME.
+If WORKFLOW-NAME is nil, uses the workflow of the currently focused
+`*claude-dashboard:<name>*' buffer (if any), or the workflow of an agent
+buffer at point, or prompts.  The side panel auto-updates whenever you
+open a different workflow's main dashboard."
+  (interactive)
+  (let* ((name (or workflow-name
+                   agents-workflow--side-current-wf
+                   ;; Try to infer from current buffer name.
+                   (and (string-match "^\\*claude-dashboard:\\([^:]+\\)\\*"
+                                      (buffer-name))
+                        (match-string 1 (buffer-name)))
+                   (and (hash-table-keys agents-workflow--registry)
+                        (completing-read "Side dashboard for workflow: "
+                                         (hash-table-keys agents-workflow--registry)
+                                         nil t))))
+         (wf (and name (agents-workflow--get name))))
+    (unless wf (user-error "No workflow named %s" (or name "<nil>")))
+    (setq agents-workflow--side-current-wf name)
+    ;; Create/refresh a single shared side buffer (not <wf>-specific so the
+    ;; layout doesn't churn when switching workflows).
+    (let ((buf (claude-dashboard-create
+                :name "side"
+                :header (lambda ()
+                          (let ((wf-now (agents-workflow--get
+                                         agents-workflow--side-current-wf)))
+                            (when wf-now
+                              (format " %s"
+                                      (agents-workflow-name wf-now)))))
+                :panels (list (agents-workflow-agents-panel-compact wf)))))
+      (agents-workflow--side-display-buffer buf)
+      buf)))
+
+(defun agents-workflow--side-follow-current ()
+  "If the side dashboard is open, repoint it at the workflow whose
+main dashboard is currently selected.  Wired into `agents-workflow-dashboard'
+via after-advice so the side panel follows your focus."
+  (when (and (get-buffer agents-workflow--side-buffer-name)
+             (string-match "^\\*claude-dashboard:\\([^:*]+\\)\\*"
+                           (buffer-name)))
+    (let ((wf-name (match-string 1 (buffer-name))))
+      (unless (equal wf-name "side")
+        (when (and wf-name
+                   (not (equal wf-name agents-workflow--side-current-wf)))
+          (agents-workflow-side-dashboard wf-name))))))
+
+(advice-add 'agents-workflow-dashboard :after
+            (lambda (&rest _)
+              (agents-workflow--side-follow-current)))
 
 (defun agents-workflow--panel-find-agent (wf-name row-id)
   "Find agent with name ROW-ID in workflow WF-NAME."
@@ -680,16 +772,28 @@ the live buffer or nil."
           (agents-workflow--install-title-watcher agent)
           matching)))))
 
+(defun agents-workflow--visit-agent-display-action ()
+  "Return the `display-buffer' action used by `--panel-visit-agent'.
+Stickiness is conditional: if the side dashboard is open, the main
+dashboard's window can be displaced by the agent buffer (the side panel
+still keeps agents in view).  If the side dashboard is not open, the
+main dashboard's window is preserved and the agent opens elsewhere."
+  (let ((side-open (and (get-buffer agents-workflow--side-buffer-name)
+                        (get-buffer-window
+                         agents-workflow--side-buffer-name))))
+    `((display-buffer-reuse-window
+       display-buffer-use-some-window)
+      (inhibit-same-window . ,(not side-open)))))
+
 (defun agents-workflow--panel-visit-agent (wf-name row-id)
-  "Visit agent ROW-ID from workflow WF-NAME in another window.
+  "Visit agent ROW-ID from workflow WF-NAME.
+Stickiness of the dashboard window depends on whether the side
+dashboard is open — see `agents-workflow--visit-agent-display-action'.
 If the agent's buffer field is nil or stale, try to reconnect.
 If no buffer exists at all, offer to relaunch the agent."
   (if-let ((agent (agents-workflow--panel-find-agent wf-name row-id)))
       (if-let ((buf (agents-workflow--ensure-agent-buffer agent)))
-          (pop-to-buffer buf
-                         '((display-buffer-reuse-window
-                            display-buffer-use-some-window)
-                           (inhibit-same-window . t)))
+          (pop-to-buffer buf (agents-workflow--visit-agent-display-action))
         ;; No buffer — relaunch the agent
         (when (y-or-n-p (format "Agent %s has no buffer. Relaunch? " row-id))
           (let ((wf (agents-workflow--get wf-name)))
@@ -698,9 +802,7 @@ If no buffer exists at all, offer to relaunch the agent."
                          (lambda ()
                            (when-let ((buf (agents-workflow--ensure-agent-buffer agent)))
                              (pop-to-buffer buf
-                                            '((display-buffer-reuse-window
-                                               display-buffer-use-some-window)
-                                              (inhibit-same-window . t)))))))))
+                                            (agents-workflow--visit-agent-display-action))))))))
     (message "Agent %s not found" row-id)))
 
 (defun agents-workflow--panel-send-command (wf-name row-id)
@@ -945,9 +1047,15 @@ session's Claude Code transcript, then starts it in the same directory."
               (src (agents-workflow--find-agent-by-name wf row-id)))
     (unless (eq (agents-workflow-agent-type src) 'interactive)
       (user-error "Fork only supported for interactive agents"))
-    (let ((src-id (agents-workflow-agent-session-id src)))
+    (let ((src-id (agents-workflow-agent-session-id src))
+          (src-dir (agents-workflow-agent-directory src)))
       (unless src-id
         (user-error "Source agent has no session-id yet — start it first"))
+      (unless (and src-dir (file-directory-p src-dir))
+        (user-error "Source agent's directory does not exist: %s\n\
+Fix the workflow .eld file before forking — the cloned agent would
+inherit the same broken path and produce an empty Claude buffer"
+                    src-dir))
       ;; Default to the next free fork-N name; let the user override.
       (let* ((existing (mapcar #'agents-workflow-agent-name
                                (agents-workflow-agents wf)))
@@ -1091,6 +1199,19 @@ The agent remains in the dashboard showing as idle (sleep icon)."
             (message "Killed agent %s (still in dashboard, relaunch with RET → s)" row-id))
         (message "Agent %s not found" row-id))
     (message "Workflow %s not found" wf-name)))
+
+(defun agents-workflow--persist-workflow (wf-name)
+  "Persist WF-NAME's definition (.eld) and session state (.state.eld) to disk.
+Logs a warning on failure rather than signalling, so callers in the
+panel-action path don't leave the dashboard half-updated when a save
+fails (e.g. read-only filesystem)."
+  (condition-case err
+      (progn
+        (agents-workflow-save wf-name)
+        (agents-workflow-save-state wf-name))
+    (error
+     (message "Warning: workflow %s mutated in memory but save failed: %s"
+              wf-name (error-message-string err)))))
 
 (defun agents-workflow--panel-delete-agent (wf-name row-id)
   "Remove agent ROW-ID from workflow WF-NAME without killing its buffer."
