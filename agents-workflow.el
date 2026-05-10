@@ -687,17 +687,46 @@ open a different workflow's main dashboard."
     (setq agents-workflow--side-current-wf name)
     ;; Create/refresh a single shared side buffer (not <wf>-specific so the
     ;; layout doesn't churn when switching workflows).
-    (let ((buf (claude-dashboard-create
-                :name "side"
-                :header (lambda ()
-                          (let ((wf-now (agents-workflow--get
-                                         agents-workflow--side-current-wf)))
-                            (when wf-now
-                              (format " %s"
-                                      (agents-workflow-name wf-now)))))
-                :panels (list (agents-workflow-agents-panel-compact wf)))))
-      (agents-workflow--side-display-buffer buf)
-      buf)))
+    (let* ((panels (list (agents-workflow-agents-panel-compact wf))))
+      ;; Mirror the main dashboard's optional-panel list.  Same auto-require
+      ;; + registry-lookup pattern as `agents-workflow-dashboard'.
+      (dolist (panel-name (agents-workflow-panels wf))
+        (when-let ((entry (alist-get panel-name agents-workflow-panel-registry
+                                     nil nil #'equal)))
+          (let ((constructor (car entry))
+                (feature (cdr entry)))
+            (unless (fboundp constructor)
+              (require feature nil t))
+            (when (fboundp constructor)
+              (setq panels (append panels (list (funcall constructor))))))))
+      (let ((buf (claude-dashboard-create
+                  :name "side"
+                  :header (lambda ()
+                            (let ((wf-now (agents-workflow--get
+                                           agents-workflow--side-current-wf)))
+                              (when wf-now
+                                (format " %s"
+                                        (agents-workflow-name wf-now)))))
+                  :panels panels)))
+        (agents-workflow--side-display-buffer buf)
+        buf))))
+
+(defun agents-workflow-side-focus ()
+  "Move point into the side dashboard window.
+Opens the side dashboard first if it isn\\='t already showing.
+Bypasses the `no-other-window' parameter, which is what makes
+`C-x o' skip the side panel.  Suggested binding: bind
+`agents-workflow-side-focus' to a global key such as C-c W."
+  (interactive)
+  (let ((buf (or (get-buffer agents-workflow--side-buffer-name)
+                 (agents-workflow-side-dashboard))))
+    (let ((win (get-buffer-window buf)))
+      (unless win
+        ;; Side panel buffer exists but isn't displayed — re-display it.
+        (agents-workflow--side-display-buffer buf)
+        (setq win (get-buffer-window buf)))
+      (when win
+        (select-window win)))))
 
 (defun agents-workflow--side-follow-current ()
   "If the side dashboard is open, repoint it at the workflow whose
