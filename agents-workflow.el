@@ -611,6 +611,19 @@ For use with `claude-dashboard-create'."
      :interval 3
      :context wf-name)))
 
+(defun agents-workflow--persist-workflow (wf-name)
+  "Persist WF-NAME's definition (.eld) and session state (.state.eld) to disk.
+Logs a warning on failure rather than signalling, so callers in the
+panel-action path don't leave the dashboard half-updated when a save
+fails (e.g. read-only filesystem)."
+  (condition-case err
+      (progn
+        (agents-workflow-save wf-name)
+        (agents-workflow-save-state wf-name))
+    (error
+     (message "Warning: workflow %s mutated in memory but save failed: %s"
+              wf-name (error-message-string err)))))
+
 (defun agents-workflow--panel-find-agent (wf-name row-id)
   "Find agent with name ROW-ID in workflow WF-NAME."
   (when-let ((wf (agents-workflow--get wf-name)))
@@ -883,6 +896,7 @@ the user chose to use the base directory directly."
           (setf (agents-workflow-agents wf)
                 (append (agents-workflow-agents wf) (list agent)))
           (agents-workflow--start-agent agent wf)
+          (agents-workflow--persist-workflow wf-name)
           (claude-dashboard-refresh-all)
           (message "Added and started %s agent %s%s"
                    backend-str name
@@ -964,6 +978,7 @@ session's Claude Code transcript, then starts it in the same directory."
               (setf (agents-workflow-agents wf)
                     (append (agents-workflow-agents wf) (list agent)))
               (agents-workflow--start-agent agent wf)
+              (agents-workflow--persist-workflow wf-name)
               (claude-dashboard-refresh-all)
               (message "Forked %s -> %s (session %s)"
                        row-id fork-name (substring new-id 0 8)))))))))
@@ -1008,9 +1023,7 @@ with the new --add-dir flag if it is running."
         (when (and (agents-workflow-agent-buffer agent)
                    (buffer-live-p (agents-workflow-agent-buffer agent)))
           (agents-workflow--restart-agent-with-dirs agent wf))
-        ;; Save state
-        (agents-workflow-save-state wf-name)
-        (agents-workflow-save wf-name)
+        (agents-workflow--persist-workflow wf-name)
         (claude-dashboard-refresh-all)
         (message "Added %s to %s%s"
                  (file-name-nondirectory (directory-file-name agent-dir))
@@ -1034,8 +1047,7 @@ with the new --add-dir flag if it is running."
         (when (and (agents-workflow-agent-buffer agent)
                    (buffer-live-p (agents-workflow-agent-buffer agent)))
           (agents-workflow--restart-agent-with-dirs agent wf))
-        (agents-workflow-save-state wf-name)
-        (agents-workflow-save wf-name)
+        (agents-workflow--persist-workflow wf-name)
         (claude-dashboard-refresh-all)
         (message "Removed %s from %s" dir-name agent-name)))))
 
@@ -1060,6 +1072,7 @@ with the new --add-dir flag if it is running."
                        (new-buf-name (format "*claude:%s:%s*" dir new-name)))
                   (with-current-buffer buf
                     (rename-buffer new-buf-name t))))))
+          (agents-workflow--persist-workflow wf-name)
           (claude-dashboard-refresh-all)
           ;; Restore cursor to the renamed row
           (claude-dashboard--goto-row new-name)
@@ -1098,6 +1111,7 @@ The agent remains in the dashboard showing as idle (sleep icon)."
             ;; Remove agent from workflow's agent list
             (setf (agents-workflow-agents wf)
                   (cl-remove agent (agents-workflow-agents wf) :test #'eq))
+            (agents-workflow--persist-workflow wf-name)
             (claude-dashboard-refresh-all)
             (message "Removed agent %s" row-id))
         ;; Agent not in list (stale dashboard row) — refresh to clear it
