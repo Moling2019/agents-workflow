@@ -225,11 +225,21 @@ Reads `dashboard-panel' and `dashboard-row-id' text properties."
 
 ;;;; Mode
 
+(defun claude-dashboard-mouse-visit (event)
+  "Move point to mouse EVENT location and dispatch the row's `RET' action.
+Bound to `[double-mouse-1]' so a single click positions the cursor (the
+default `mouse-set-point' behavior of `special-mode') and a double click
+opens the agent — matching Finder-style row interaction."
+  (interactive "e")
+  (mouse-set-point event)
+  (claude-dashboard--dispatch-action "RET"))
+
 (defvar claude-dashboard-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (define-key map "g" #'claude-dashboard-refresh-all)
     (define-key map "q" #'quit-window)
+    (define-key map [double-mouse-1] #'claude-dashboard-mouse-visit)
     map)
   "Keymap for `claude-dashboard-mode'.
 Panel-specific keys are added dynamically by `claude-dashboard-create'.")
