@@ -1582,6 +1582,20 @@ WORKFLOW is used for emitting completion events."
 
 ;;;; Interactive agent integration
 
+(defcustom agents-workflow-lazy-start nil
+  "When non-nil, `agents-workflow-start' does not auto-spawn agents.
+Agents stay asleep (no Claude/Codex process, no eat buffer) until
+the user explicitly visits them via `RET' / double-click on the
+dashboard row, which prompts to relaunch.
+
+Use this to keep RAM/CPU footprint low when you want the dashboard
+visible but only need a couple of the listed agents active right now.
+The workflow's optional dashboard panels (databricks, jira, github,
+etc.) still refresh on their normal timers — only agent processes are
+deferred."
+  :type 'boolean
+  :group 'agents-workflow)
+
 (defcustom agents-workflow-last-output-lines 100
   "Number of lines to extract from interactive agent buffer as last output."
   :type 'integer
@@ -2074,9 +2088,14 @@ Launches agents, registers hooks, opens dashboard."
     ;; Load saved session state if available
     (agents-workflow-load-state workflow-name)
 
-    ;; Start agents
-    (dolist (agent (agents-workflow-agents wf))
-      (agents-workflow--start-agent agent wf))
+    ;; Start agents — unless lazy-start is set, in which case agents stay
+    ;; asleep until the user visits a row in the dashboard (which prompts
+    ;; to relaunch via `--panel-visit-agent').
+    (if agents-workflow-lazy-start
+        (message "Workflow %s started (lazy: %d agents asleep — RET on a row to launch)"
+                 workflow-name (length (agents-workflow-agents wf)))
+      (dolist (agent (agents-workflow-agents wf))
+        (agents-workflow--start-agent agent wf)))
 
     ;; Set state
     (setf (agents-workflow-state wf) 'running)
