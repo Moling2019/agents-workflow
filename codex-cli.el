@@ -21,6 +21,7 @@
 (declare-function eat-make "eat")
 (declare-function eat-term-send-string "eat")
 (declare-function eat-semi-char-mode "eat")
+(declare-function eat--set-cursor "eat")
 (defvar eat-terminal)
 (defvar eat-update-hook)
 
@@ -147,12 +148,9 @@ Returns the buffer, or nil if creation failed."
         ;; Buffer appearance (must run AFTER interactive-mode which resets
         ;; eat-invisible-cursor-type to nil)
         (codex-cli--setup-buffer-appearance)
-        ;; Force cursor visible — Codex TUI hides cursor via escape
-        ;; sequences and claude-code interactive mode sets
-        ;; eat-invisible-cursor-type to nil.  We need a post-command hook
-        ;; to continuously enforce visibility since eat resets cursor-type
-        ;; on every terminal update.
-        (codex-cli--force-cursor-visible)
+        ;; Make Codex's hidden cursor render as a visible bar without
+        ;; fighting EAT on every update hook.
+        (codex-cli--apply-cursor-visibility)
         (run-hooks 'claude-code-start-hook))
       (codex-cli--install-idle-timer buffer)
       buffer)))
@@ -163,7 +161,8 @@ Returns the buffer, or nil if creation failed."
   "Configure the current buffer to look like a polished Codex terminal."
   ;; Remove visual clutter
   (setq-local vertical-scroll-bar nil)
-  (set-window-fringes (get-buffer-window (current-buffer)) 0 0)
+  (when-let ((win (get-buffer-window (current-buffer))))
+    (set-window-fringes win 0 0))
   ;; Remove underline from nobreak-space (same as claude-code)
   (face-remap-add-relative 'nobreak-space :underline nil)
   ;; Keep cursor visible even when Codex CLI sends hide-cursor escapes.
@@ -186,20 +185,13 @@ Returns the buffer, or nil if creation failed."
 
 ;;;; Cursor visibility
 
-(defun codex-cli--force-cursor-visible ()
-  "Ensure cursor stays visible in the current Codex buffer.
-Codex CLI's TUI hides the cursor via escape sequences, and eat's
-interactive mode sets `eat-invisible-cursor-type' to nil so the
-cursor truly disappears.  This function overrides that and installs
-a hook to re-enforce cursor visibility after every terminal update."
+(defun codex-cli--apply-cursor-visibility ()
+  "Ensure Codex's hidden cursor renders as a visible bar.
+Codex CLI sends hide-cursor escapes.  EAT maps that state through
+`eat-invisible-cursor-type', so set that mapping to a bar cursor and
+re-apply the current invisible-cursor state once."
   (setq-local eat-invisible-cursor-type '(bar nil nil))
-  (setq-local cursor-type 'bar)
-  (add-hook 'eat-update-hook #'codex-cli--restore-cursor nil t))
-
-(defun codex-cli--restore-cursor ()
-  "Restore cursor visibility after an eat terminal update."
-  (when (eq cursor-type nil)
-    (setq-local cursor-type 'bar)))
+  (eat--set-cursor nil :invisible))
 
 ;;;; Sending commands
 
