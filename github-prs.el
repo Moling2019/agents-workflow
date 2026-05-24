@@ -21,8 +21,25 @@
   :prefix "github-prs-")
 
 (defcustom github-prs-author "@me"
-  "GitHub author filter for PR search."
+  "GitHub author filter for PR search.
+Used when `github-prs-accounts' is nil (single-account mode).
+The literal value is passed to `gh search prs --author'."
   :type 'string
+  :group 'github-prs)
+
+(defcustom github-prs-accounts nil
+  "Optional list of (AUTHOR . GH-USER) pairs for multi-account queries.
+Each entry causes the panel to query PRs authored by AUTHOR using the
+token of GH-USER, looked up via `gh auth token --user GH-USER'.
+When non-nil, `github-prs-author' is ignored and results from all
+listed accounts are merged and deduplicated by URL.
+
+Requires `jq' on PATH for client-side merging.
+
+Example:
+  ((\"molingzhang\" . \"molingzhang\")
+   (\"Moling2019\"  . \"Moling2019\"))"
+  :type '(repeat (cons string string))
   :group 'github-prs)
 
 (defcustom github-prs-state "open"
@@ -166,14 +183,46 @@ Only considers actual build checks, not approval/meta checks."
 
 ;;; --- Phase 1: List PRs ---
 
+(defun github-prs--single-account-command (author &optional gh-user)
+  "Build a `gh search prs' shell command for AUTHOR.
+When GH-USER is non-nil, use that account's token via
+`gh auth token --user GH-USER' instead of the active account.
+The fetched fields stay in sync with the parser in `github-prs--fetch'."
+  (let ((token-prefix
+         (if gh-user
+             (format "GH_TOKEN=$(%s auth token --user %s 2>/dev/null) "
+                     (shell-quote-argument github-prs-gh-program)
+                     (shell-quote-argument gh-user))
+           "")))
+    (format "NO_COLOR=1 %s%s search prs --author %s --state %s --json %s --limit %d 2>/dev/null"
+            token-prefix
+            (shell-quote-argument github-prs-gh-program)
+            (shell-quote-argument author)
+            (shell-quote-argument github-prs-state)
+            "number,title,repository,updatedAt,url,isDraft,commentsCount"
+            github-prs-limit)))
+
 (defun github-prs--list-command ()
-  "Return the gh command to list PRs as JSON."
-  (format "NO_COLOR=1 %s search prs --author %s --state %s --json %s --limit %d 2>/dev/null"
-          (shell-quote-argument github-prs-gh-program)
-          (shell-quote-argument github-prs-author)
-          (shell-quote-argument github-prs-state)
-          "number,title,repository,updatedAt,url,isDraft,commentsCount"
-          github-prs-limit))
+  "Return the gh command to list PRs as JSON.
+Single-account mode (the default): one `gh search prs' call using
+`github-prs-author'.  Multi-account mode (when `github-prs-accounts'
+is non-nil): one call per account with that account's token, then
+`jq -s' merges + dedupes by URL."
+  (if (null github-prs-accounts)
+      (github-prs--single-account-command github-prs-author)
+    (let ((per-account
+           (mapconcat
+            (lambda (acc)
+              (github-prs--single-account-command (car acc) (cdr acc)))
+            github-prs-accounts
+            " ; ")))
+      ;; jq -s 'add // []' handles the case where every account returns
+      ;; nothing (e.g. all auth tokens expired) — emits [] instead of error.
+      ;; jq -M forces monochrome output: Emacs's async subprocess channel
+      ;; looks like a TTY to jq, so without -M it emits ANSI color codes
+      ;; that break `json-read-from-string'.
+      (format "(%s) | jq -M -s 'add // [] | unique_by(.url) | sort_by(.updatedAt) | reverse'"
+              per-account))))
 
 (defun github-prs--fetch ()
   "Fetch PRs asynchronously (phase 1: list, then phase 2: enrich)."
