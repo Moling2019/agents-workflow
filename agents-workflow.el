@@ -1038,7 +1038,8 @@ the user chose to use the base directory directly."
 Replaces \"/\", \".\", and \"_\" with \"-\".  E.g.
 /Users/foo.bar/baz_qux -> -Users-foo-bar-baz-qux, matching Claude
 Code's filesystem-safe scheme."
-  (replace-regexp-in-string "[/._]" "-" (expand-file-name path)))
+  (replace-regexp-in-string "[/._]" "-"
+                            (directory-file-name (expand-file-name path))))
 
 (defun agents-workflow--clone-session-files (old-id new-id project-dir)
   "Copy Claude Code session OLD-ID's transcript + tool-results to NEW-ID.
