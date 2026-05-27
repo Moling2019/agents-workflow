@@ -75,16 +75,12 @@ site = %S
 project = %S
 jql = %S or ('project = ' + project + ' AND assignee = currentUser() AND status != Done ORDER BY issuetype ASC, rank ASC')
 url = 'https://' + site + '/rest/api/3/search/jql'
-payload = {'jql': jql, 'maxResults': 50,
-           'fields': ['summary','status','issuetype','parent']}
-resp = requests.post(url, json=payload, auth=(email, token))
-resp.raise_for_status()
-issues = []
-for issue in resp.json()['issues']:
+
+def to_record(issue):
     f = issue['fields']
     parent = f.get('parent') or {}
     pf = parent.get('fields') or {}
-    issues.append({
+    return {
         'key': issue['key'],
         'summary': f['summary'],
         'status': f['status']['name'],
@@ -93,7 +89,27 @@ for issue in resp.json()['issues']:
         'parent_key': parent.get('key', ''),
         'parent_summary': pf.get('summary', ''),
         'url': 'https://' + site + '/browse/' + issue['key']
-    })
+    }
+
+resp = requests.post(url, json={'jql': jql, 'maxResults': 50,
+                                'fields': ['summary','status','issuetype','parent']},
+                     auth=(email, token))
+resp.raise_for_status()
+issues = [to_record(i) for i in resp.json()['issues']]
+
+# Pull in parent epics referenced by tasks but missing from the primary result
+# (e.g. epic owned by someone else but child task is mine).
+present = {i['key'] for i in issues}
+missing_parents = sorted({i['parent_key'] for i in issues
+                          if i['parent_key'] and i['parent_key'] not in present})
+if missing_parents:
+    parent_jql = 'key in (' + ','.join(missing_parents) + ')'
+    resp2 = requests.post(url, json={'jql': parent_jql, 'maxResults': 50,
+                                     'fields': ['summary','status','issuetype','parent']},
+                          auth=(email, token))
+    resp2.raise_for_status()
+    issues.extend(to_record(i) for i in resp2.json()['issues'])
+
 print(json.dumps(issues))
 " jira-board-site
   jira-board-project
