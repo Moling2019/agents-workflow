@@ -21,7 +21,15 @@
 (declare-function eat-make "eat")
 (declare-function eat-term-send-string "eat")
 (declare-function eat-semi-char-mode "eat")
+(declare-function eat--cursor-blink-mode "eat" (&optional arg))
 (declare-function eat--set-cursor "eat")
+(defvar eat-default-cursor-type)
+(defvar eat-very-visible-cursor-type)
+(defvar eat-vertical-bar-cursor-type)
+(defvar eat-very-visible-vertical-bar-cursor-type)
+(defvar eat-horizontal-bar-cursor-type)
+(defvar eat-very-visible-horizontal-bar-cursor-type)
+(defvar eat--cursor-blink-mode)
 (defvar eat-terminal)
 (defvar eat-update-hook)
 
@@ -163,6 +171,9 @@ Returns the buffer, or nil if creation failed."
   (setq-local vertical-scroll-bar nil)
   (when-let ((win (get-buffer-window (current-buffer))))
     (set-window-fringes win 0 0))
+  ;; Emacs cursor blinking causes visible full-frame repaints in active
+  ;; Eat windows on macOS, so keep it off for Codex terminals.
+  (setq-local blink-cursor-mode nil)
   ;; Remove underline from nobreak-space (same as claude-code)
   (face-remap-add-relative 'nobreak-space :underline nil)
   ;; Keep cursor visible even when Codex CLI sends hide-cursor escapes.
@@ -185,12 +196,31 @@ Returns the buffer, or nil if creation failed."
 
 ;;;; Cursor visibility
 
+(defun codex-cli--nonblinking-cursor-type (cursor-spec)
+  "Return CURSOR-SPEC with blinking disabled."
+  (list (nth 0 cursor-spec) nil (nth 2 cursor-spec)))
+
 (defun codex-cli--apply-cursor-visibility ()
   "Ensure Codex's hidden cursor renders as a visible bar.
 Codex CLI sends hide-cursor escapes.  EAT maps that state through
-`eat-invisible-cursor-type', so set that mapping to a bar cursor and
-re-apply the current invisible-cursor state once."
+`eat-invisible-cursor-type', so set that mapping to a bar cursor.
+
+EAT implements blinking cursors by redrawing the entire frame on a
+timer, which is expensive and causes visible repainting in active Codex
+windows.  Force the blinking cursor variants to non-blinking mappings
+before re-applying the current invisible-cursor state."
   (setq-local eat-invisible-cursor-type '(bar nil nil))
+  (setq-local eat-very-visible-cursor-type
+              (codex-cli--nonblinking-cursor-type
+               eat-very-visible-cursor-type))
+  (setq-local eat-very-visible-vertical-bar-cursor-type
+              (codex-cli--nonblinking-cursor-type
+               eat-very-visible-vertical-bar-cursor-type))
+  (setq-local eat-very-visible-horizontal-bar-cursor-type
+              (codex-cli--nonblinking-cursor-type
+               eat-very-visible-horizontal-bar-cursor-type))
+  (when (bound-and-true-p eat--cursor-blink-mode)
+    (eat--cursor-blink-mode -1))
   (eat--set-cursor nil :invisible))
 
 ;;;; Sending commands

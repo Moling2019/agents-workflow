@@ -1,4 +1,5 @@
 ;;; codex-cli-tests.el --- Tests for codex-cli -*- lexical-binding: t; -*-
+(require 'cl-lib)
 (require 'ert)
 (require 'codex-cli)
 
@@ -87,6 +88,36 @@
     (setq codex-cli--idle-timer nil)
     (codex-cli--cancel-idle-timer)
     (should (null codex-cli--idle-timer))))
+
+(ert-deftest codex-cli-test-nonblinking-cursor-type ()
+  "Blinking cursor mappings are converted to non-blinking ones."
+  (should (equal (codex-cli--nonblinking-cursor-type '(bar 2 nil))
+                 '(bar nil nil)))
+  (should (equal (codex-cli--nonblinking-cursor-type '(box 1 hollow))
+                 '(box nil hollow))))
+
+(ert-deftest codex-cli-test-apply-cursor-visibility-disables-blink ()
+  "Cursor visibility setup disables Eat blinking in Codex buffers."
+  (with-temp-buffer
+    (setq-local eat-very-visible-cursor-type '(box 2 hollow))
+    (setq-local eat-very-visible-vertical-bar-cursor-type '(bar 2 nil))
+    (setq-local eat-very-visible-horizontal-bar-cursor-type '(hbar 2 nil))
+    (let ((blink-arg 'unset)
+          (cursor-args nil))
+      (setq-local eat--cursor-blink-mode t)
+      (cl-letf (((symbol-function 'eat--cursor-blink-mode)
+                 (lambda (arg) (setq blink-arg arg)))
+                ((symbol-function 'eat--set-cursor)
+                 (lambda (&rest args) (setq cursor-args args))))
+        (codex-cli--apply-cursor-visibility))
+      (should (equal eat-invisible-cursor-type '(bar nil nil)))
+      (should (equal eat-very-visible-cursor-type '(box nil hollow)))
+      (should (equal eat-very-visible-vertical-bar-cursor-type
+                     '(bar nil nil)))
+      (should (equal eat-very-visible-horizontal-bar-cursor-type
+                     '(hbar nil nil)))
+      (should (equal blink-arg -1))
+      (should (equal cursor-args '(nil :invisible))))))
 
 (provide 'codex-cli-tests)
 ;;; codex-cli-tests.el ends here
