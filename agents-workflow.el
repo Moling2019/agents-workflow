@@ -641,11 +641,31 @@ Drops Type / Dir / Activity columns; keeps Name + Status + Last Output."
                                                (aref full 2)
                                                (aref full 5)))))
                           (agents-workflow--dashboard-entries wf))))
-     ;; Same actions as the full panel — small set is plenty for a side view.
+     ;; Full action set (mirrors `agents-workflow-agents-panel') so every
+     ;; shortcut works from the side panel, and the compact mode-line lists
+     ;; them all.
      :actions `(("RET" . ,(lambda (_panel row-id)
                             (agents-workflow--panel-visit-agent wf-name row-id)))
                 ("s" . ,(lambda (_panel row-id)
                           (agents-workflow--panel-send-command wf-name row-id)))
+                ("l" . ,(lambda (_panel row-id)
+                          (agents-workflow--panel-link-agent wf-name row-id)))
+                ("a" . ,(lambda (_panel _row-id)
+                          (agents-workflow--panel-add-agent wf-name)))
+                ("R" . ,(lambda (_panel row-id)
+                          (agents-workflow--panel-rename-agent wf-name row-id)))
+                ("d" . ,(lambda (_panel row-id)
+                          (if (string-match "\\(.+\\)::extra-\\([0-9]+\\)" row-id)
+                              (agents-workflow--panel-remove-extra-dir
+                               wf-name (match-string 1 row-id)
+                               (string-to-number (match-string 2 row-id)))
+                            (agents-workflow--panel-delete-agent wf-name row-id))))
+                ("i" . ,(lambda (_panel row-id)
+                          (agents-workflow--panel-insert-directory wf-name row-id)))
+                ("C-o" . ,(lambda (_panel row-id)
+                            (agents-workflow--panel-toggle-expand wf-name row-id)))
+                ("C-k C-k" . ,(lambda (_panel row-id)
+                                (agents-workflow--panel-kill-agent wf-name row-id)))
                 ("c" . ,(lambda (_panel row-id)
                           (agents-workflow--panel-fork-agent wf-name row-id))))
      :interval 3
@@ -662,8 +682,7 @@ Drops Type / Dir / Activity columns; keeps Name + Status + Last Output."
      (window-parameters
       ;; Stick around through C-x 1 and don't get cycled into by C-x o.
       (no-delete-other-windows . t)
-      (no-other-window . t)
-      (mode-line-format . none)))))
+      (no-other-window . t)))))
 
 (defun agents-workflow-side-dashboard (&optional workflow-name)
   "Open the always-visible compact side dashboard for WORKFLOW-NAME.
@@ -708,6 +727,16 @@ open a different workflow's main dashboard."
                                 (format " %s"
                                         (agents-workflow-name wf-now)))))
                   :panels panels)))
+        (with-current-buffer buf
+          ;; Narrow window: render the key hints compactly so all of the
+          ;; agents panel's shortcuts fit on one mode-line.
+          (setq-local claude-dashboard--compact-mode-line t)
+          ;; The side window isn't the selected window, so its buffer-local
+          ;; `post-command-hook' never fires to build the mode-line.  Seed it
+          ;; now from the primary (agents) panel; focusing the window and
+          ;; moving over rows refreshes it per-panel from there.
+          (setq mode-line-format
+                (claude-dashboard--build-mode-line-for-panel (car panels))))
         (agents-workflow--side-display-buffer buf)
         buf))))
 

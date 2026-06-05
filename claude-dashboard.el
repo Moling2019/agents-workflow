@@ -197,6 +197,11 @@ Each data row gets `dashboard-panel' and `dashboard-row-id' text properties."
 (defvar-local claude-dashboard--current-panel nil
   "Name of the panel under point (cached for mode-line).")
 
+(defvar-local claude-dashboard--compact-mode-line nil
+  "When non-nil, render the mode-line hint compactly.
+Plain keys, no chip padding, so the full action set fits in a
+narrow side window where padded chips would overflow and truncate.")
+
 ;;;; Panel Lookup
 
 (defun claude-dashboard--find-panel (name)
@@ -453,20 +458,28 @@ Called by per-panel timers.  Re-renders only the affected section."
 ;;;; Context-Sensitive Mode-Line
 
 (defun claude-dashboard--build-mode-line-for-panel (panel)
-  "Build a mode-line hint list for PANEL's actions."
+  "Build a mode-line hint list for PANEL's actions.
+When `claude-dashboard--compact-mode-line' is non-nil, render keys
+plainly (no chip background or padding) so the full action set fits in
+a narrow side window without truncating."
   (if (null panel)
       (list " " (propertize " Dashboard " 'face '(:foreground "#a6adc8")))
-    (let ((parts (list " "))
-          (actions (plist-get panel :actions)))
+    (let* ((compact claude-dashboard--compact-mode-line)
+           (key-face (if compact
+                         '(:foreground "#89b4fa" :weight bold)
+                       '(:foreground "#1e1e2e" :background "#89b4fa")))
+           (parts (list " "))
+           (actions (plist-get panel :actions)))
       (dolist (action actions)
         (let ((key (car action)))
-          (push (propertize (format " %s " key)
-                            'face '(:foreground "#1e1e2e" :background "#89b4fa"))
+          (push (propertize (if compact (format "%s" key) (format " %s " key))
+                            'face key-face)
                 parts)
           (push " " parts)))
-      ;; Always add g and q
-      (push (propertize " g " 'face '(:foreground "#1e1e2e" :background "#89b4fa")) parts)
-      (push (propertize " refresh " 'face '(:foreground "#a6adc8")) parts)
+      ;; Always add g (refresh).
+      (push (propertize (if compact "g" " g ") 'face key-face) parts)
+      (unless compact
+        (push (propertize " refresh " 'face '(:foreground "#a6adc8")) parts))
       (nreverse parts))))
 
 (defun claude-dashboard--update-mode-line ()
