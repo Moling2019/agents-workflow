@@ -1917,8 +1917,60 @@ If the agent has a session-id, resumes that session with --resume."
             (run-hooks 'claude-code-start-hook))
           (setf (agents-workflow-agent-buffer agent) buffer))))))
 
+(defun agents-workflow--first-line (file)
+  "Return the first line of FILE (reading at most 1 MB), or nil.
+The cap keeps us from slurping a whole rollout while still capturing
+Codex's session-meta line, which embeds the system prompt and can run
+to tens of KB."
+  (ignore-errors
+    (with-temp-buffer
+      (insert-file-contents file nil 0 1048576)
+      (buffer-substring-no-properties (point-min) (line-end-position)))))
+
+(defun agents-workflow--codex-latest-session-id (dir)
+  "Return the session id of the newest Codex rollout whose cwd is DIR.
+Codex mints its own session id (unlike Claude's presettable
+--session-id), so capture it post-hoc from the rollout files under
+~/.codex/sessions.  Returns nil when no rollout matches DIR."
+  (let ((root (expand-file-name "~/.codex/sessions"))
+        (target (file-truename (expand-file-name dir))))
+    (when (file-directory-p root)
+      (let ((files (sort (directory-files-recursively
+                          root "\\`rollout-.*\\.jsonl\\'")
+                         (lambda (a b)
+                           (time-less-p
+                            (file-attribute-modification-time
+                             (file-attributes b))
+                            (file-attribute-modification-time
+                             (file-attributes a)))))))
+        (catch 'found
+          (dolist (f files)
+            (when-let* ((line (agents-workflow--first-line f))
+                        (obj (ignore-errors (json-parse-string line)))
+                        ((hash-table-p obj))
+                        (payload (gethash "payload" obj))
+                        ((hash-table-p payload))
+                        (cwd (gethash "cwd" payload))
+                        (sid (gethash "id" payload)))
+              (when (equal (file-truename (expand-file-name cwd)) target)
+                (throw 'found sid)))))))))
+
+(defun agents-workflow--codex-capture-session-id (agent dir)
+  "Capture AGENT's Codex session id from the rollout for DIR and persist it.
+No-op if AGENT already has a session-id or none is found yet."
+  (when (and (agents-workflow-agent-p agent)
+             (not (agents-workflow-agent-session-id agent)))
+    (when-let ((sid (agents-workflow--codex-latest-session-id dir)))
+      (setf (agents-workflow-agent-session-id agent) sid)
+      (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+        (agents-workflow--persist-workflow (agents-workflow-name wf))))))
+
 (defun agents-workflow--start-codex-interactive (agent)
-  "Start interactive AGENT by creating a Codex eat terminal."
+  "Start interactive AGENT by creating a Codex eat terminal.
+If AGENT has a session-id, resume that Codex session via the `resume'
+subcommand.  Otherwise launch fresh and capture Codex's self-minted
+session id from its rollout once written, so later restarts/reloads can
+resume it (Codex, unlike Claude, does not accept a preset session id)."
   (let* ((dir (agents-workflow-agent-directory agent))
          (instance-name (agents-workflow-agent-name agent))
          (existing (codex-cli--find-buffers-for-directory dir))
@@ -1930,9 +1982,19 @@ If the agent has a session-id, resumes that session with --resume."
                     existing)))
     (if matching
         (setf (agents-workflow-agent-buffer agent) matching)
-      (let ((buffer (codex-cli--start dir instance-name)))
+      (let* ((session-id (agents-workflow-agent-session-id agent))
+             ;; `resume <id>' is a subcommand; the base global switches
+             ;; (sandbox, --no-alt-screen) legitimately precede it.
+             (resume-switches (when session-id (list "resume" session-id)))
+             (buffer (codex-cli--start dir instance-name resume-switches)))
         (when buffer
           (setf (agents-workflow-agent-buffer agent) buffer)
+          ;; Fresh launch: grab Codex's own session id from the rollout once
+          ;; it lands, so a future restart/reload can `codex resume' it.
+          (unless session-id
+            (run-at-time 10 nil
+                         #'agents-workflow--codex-capture-session-id
+                         agent dir))
           (let ((system-prompt (or (agents-workflow-agent-system-prompt agent)
                                    (agents-workflow--convention-system-prompt
                                     instance-name))))
