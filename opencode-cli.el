@@ -64,10 +64,14 @@
   :type 'string
   :group 'opencode-cli)
 
-(defcustom opencode-cli-program-switches '()
+(defcustom opencode-cli-program-switches '("--auto")
   "Base switches for OpenCode CLI, prepended before any extra switches.
-OpenCode's permission behavior is configured in opencode.json, so no
-dangerous-bypass flag is needed here by default."
+Defaults to (\"--auto\") — OpenCode's auto-approve-permissions mode, the
+analog of Codex's --dangerously-bypass-approvals-and-sandbox — so agents
+launched by agents-workflow run non-interactively.  This auto-approves any
+tool call not explicitly denied; scope it with the `permission' block in
+opencode.json (allow/ask/deny, bash patterns) if you want finer control.
+Set to nil to make OpenCode prompt for permissions."
   :type '(repeat string)
   :group 'opencode-cli)
 
