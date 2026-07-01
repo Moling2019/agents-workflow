@@ -1,0 +1,14 @@
+#!/bin/bash
+# Codex `notify' wrapper for agents-workflow.
+#
+# Codex invokes this on `agent-turn-complete', appending the event JSON
+# (which includes `last-assistant-message') as the final argument, and the
+# process inherits Codex's working directory (= the agent's directory).
+# We push the finished reply to Emacs, mirroring Claude Code's Stop hook:
+# the JSON is passed as a trailing emacsclient arg and read from
+# `server-eval-args-left' by `agents-workflow-handle-codex-reply'.
+json="$1"
+[ -z "$json" ] && exit 0
+dir="${PWD//\\/\\\\}"; dir="${dir//\"/\\\"}"
+emacsclient --eval "(agents-workflow-handle-codex-reply \"$dir\")" "$json" >/dev/null 2>&1 || true
+exit 0

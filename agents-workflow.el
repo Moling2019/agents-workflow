@@ -18,6 +18,14 @@
 (require 'all-the-icons)
 (require 'claude-dashboard)
 (require 'codex-cli)
+(require 'opencode-cli)
+
+;; Forward declaration; initialized (with a hash-table) near
+;; `agents-workflow--start-opencode-interactive'.
+(defvar agents-workflow--opencode-fork-pending)
+;; Dynamic var from the `server' package; the turn-end push receivers read
+;; the trailing emacsclient arg from it (same mechanism as claude-code).
+(defvar server-eval-args-left)
 (require 'databricks-runs nil t)
 (require 'jira-board nil t)
 (require 'slack-monitor nil t)
@@ -139,7 +147,13 @@ FEATURE is the symbol to `require' if the constructor is not yet loaded.")
      :dashboard-types
      ((interactive :icon "code"    :face (:foreground "#10a37f"))
       (configured  :icon "tune"    :face (:foreground "#74aa9c"))
-      (autonomous  :icon "android" :face (:foreground "#10a37f")))))
+      (autonomous  :icon "android" :face (:foreground "#10a37f"))))
+    (opencode
+     :title-idle-pattern nil
+     :dashboard-types
+     ((interactive :icon "developer_board" :face (:foreground "#f2c14e"))
+      (configured  :icon "tune"            :face (:foreground "#f2c14e"))
+      (autonomous  :icon "toys"            :face (:foreground "#f2c14e")))))
   "Backend registry mapping symbols to configuration plists.
 Program and switches are managed via defcustoms, not stored here.")
 
@@ -152,6 +166,7 @@ Program and switches are managed via defcustoms, not stored here.")
   (pcase backend
     ('claude claude-code-program)
     ('codex  codex-cli-program)
+    ('opencode opencode-cli-program)
     (_ (error "Unknown backend: %s" backend))))
 
 (defun agents-workflow--backend-base-switches (backend)
@@ -159,6 +174,7 @@ Program and switches are managed via defcustoms, not stored here.")
   (pcase backend
     ('claude claude-code-program-switches)
     ('codex  codex-cli-program-switches)
+    ('opencode opencode-cli-program-switches)
     (_ nil)))
 
 (defun agents-workflow--backend-type-config (backend type)
@@ -789,6 +805,8 @@ via after-advice so the side panel follows your focus."
        (claude-code--do-send-command cmd)))
     ('codex
      (codex-cli--send-command cmd buffer))
+    ('opencode
+     (opencode-cli--send-command cmd buffer))
     (_ (error "Unknown backend: %s" (agents-workflow-agent-backend agent)))))
 
 (defun agents-workflow--ensure-agent-buffer (agent)
@@ -810,6 +828,10 @@ the live buffer or nil."
                  (when (fboundp 'codex-cli--find-buffers-for-directory)
                    (or (codex-cli--find-buffers-for-directory dir)
                        (codex-cli--find-buffers))))
+                ('opencode
+                 (when (fboundp 'opencode-cli--find-buffers-for-directory)
+                   (or (opencode-cli--find-buffers-for-directory dir)
+                       (opencode-cli--find-buffers))))
                 (_ ; claude (default)
                  (when (fboundp 'claude-code--find-claude-buffers-for-directory)
                    (or (claude-code--find-claude-buffers-for-directory dir)
@@ -817,6 +839,7 @@ the live buffer or nil."
              (extract-fn
               (pcase backend
                 ('codex #'codex-cli--extract-instance-name)
+                ('opencode #'opencode-cli--extract-instance-name)
                 (_ #'claude-code--extract-instance-name-from-buffer-name)))
              (matching (cl-find-if
                         (lambda (b)
@@ -883,6 +906,8 @@ If no buffer exists at all, offer to relaunch the agent."
           (let* ((all-bufs (pcase (agents-workflow-agent-backend agent)
                               ('codex (when (fboundp 'codex-cli--find-buffers)
                                         (codex-cli--find-buffers)))
+                              ('opencode (when (fboundp 'opencode-cli--find-buffers)
+                                           (opencode-cli--find-buffers)))
                               (_ (when (fboundp 'claude-code--find-all-claude-buffers)
                                    (claude-code--find-all-claude-buffers)))))
                  (buf-names (mapcar #'buffer-name all-bufs)))
@@ -1035,7 +1060,7 @@ the user chose to use the base directory directly."
         (user-error "Agent name cannot be empty"))
       (when (agents-workflow--find-agent-by-name wf name)
         (user-error "Agent %s already exists" name))
-      (let* ((backend-str (completing-read "Backend: " '("claude" "codex") nil t nil nil "claude"))
+      (let* ((backend-str (completing-read "Backend: " '("claude" "codex" "opencode") nil t nil nil "claude"))
              (backend (intern backend-str))
              (wf-dir (agents-workflow-directory wf))
              (base-dir (let ((dir-choice (completing-read
@@ -1100,58 +1125,92 @@ transcript is missing."
 
 (defun agents-workflow--panel-fork-agent (wf-name row-id)
   "Fork agent ROW-ID in workflow WF-NAME (clone session, share worktree).
-Creates a sibling agent named <ROW-ID>-fork-N with a copy of the source
-session's Claude Code transcript, then starts it in the same directory."
+Creates a sibling agent named <ROW-ID>-fork-N whose conversation
+continues from the source session, then starts it in the same directory.
+
+Per-backend fork mechanism:
+- claude:   copy + rewrite the Claude Code transcript to a new UUID, and
+            preset that id via --session-id.
+- opencode: capture the source ses_... id and let OpenCode mint a forked
+            session via `opencode --session <src> --fork'.
+- codex:    not supported (Codex has no fork primitive)."
   (when-let* ((wf (agents-workflow--get wf-name))
               (src (agents-workflow--find-agent-by-name wf row-id)))
     (unless (eq (agents-workflow-agent-type src) 'interactive)
       (user-error "Fork only supported for interactive agents"))
-    (let ((src-id (agents-workflow-agent-session-id src))
-          (src-dir (agents-workflow-agent-directory src)))
-      (unless src-id
-        (user-error "Source agent has no session-id yet — start it first"))
+    (let* ((backend (agents-workflow-agent-backend src))
+           (src-dir (agents-workflow-agent-directory src)))
+      (when (eq backend 'codex)
+        (user-error "Fork is not supported for codex agents"))
       (unless (and src-dir (file-directory-p src-dir))
         (user-error "Source agent's directory does not exist: %s\n\
 Fix the workflow .eld file before forking — the cloned agent would
-inherit the same broken path and produce an empty Claude buffer"
+inherit the same broken path and produce an empty buffer"
                     src-dir))
-      ;; Default to the next free fork-N name; let the user override.
-      (let* ((existing (mapcar #'agents-workflow-agent-name
-                               (agents-workflow-agents wf)))
-             (n 1)
-             (default-name (format "%s-fork-%d" row-id n)))
-        (while (member default-name existing)
-          (setq n (1+ n)
-                default-name (format "%s-fork-%d" row-id n)))
-        (let ((fork-name (read-string
-                          (format "Fork name (default %s): " default-name)
-                          nil nil default-name)))
-          (when (string-empty-p fork-name)
-            (setq fork-name default-name))
-          (when (member fork-name existing)
-            (user-error "Agent %s already exists" fork-name))
-          (let* ((new-id (agents-workflow--generate-uuid))
-                 (dir (agents-workflow-agent-directory src)))
-            (agents-workflow--clone-session-files src-id new-id dir)
-            (let ((agent (make-agents-workflow-agent
-                          :name fork-name
-                          :type 'interactive
-                          :backend (agents-workflow-agent-backend src)
-                          :status 'idle
-                          :directory dir
-                          :session-id new-id
-                          :worktree-path (agents-workflow-agent-worktree-path src)
-                          :extra-directories (agents-workflow-agent-extra-directories src))))
+      ;; Resolve the source session id.  For opencode it may not be
+      ;; captured yet (resolved lazily), so try a capture first.
+      (when (and (eq backend 'opencode)
+                 (not (agents-workflow-agent-session-id src)))
+        (agents-workflow--opencode-capture-session-id src src-dir))
+      (let ((src-id (agents-workflow-agent-session-id src)))
+        (unless src-id
+          (user-error "Source agent has no session-id yet — start it and send at least one message first"))
+        ;; Default to the next free fork-N name; let the user override.
+        (let* ((existing (mapcar #'agents-workflow-agent-name
+                                 (agents-workflow-agents wf)))
+               (n 1)
+               (default-name (format "%s-fork-%d" row-id n)))
+          (while (member default-name existing)
+            (setq n (1+ n)
+                  default-name (format "%s-fork-%d" row-id n)))
+          (let ((fork-name (read-string
+                            (format "Fork name (default %s): " default-name)
+                            nil nil default-name)))
+            (when (string-empty-p fork-name)
+              (setq fork-name default-name))
+            (when (member fork-name existing)
+              (user-error "Agent %s already exists" fork-name))
+            (let* ((dir src-dir)
+                   ;; claude presets the forked id; opencode lets the CLI
+                   ;; mint it, so the new agent starts with no session-id.
+                   (new-id (when (eq backend 'claude)
+                             (agents-workflow--generate-uuid)))
+                   (agent (make-agents-workflow-agent
+                           :name fork-name
+                           :type 'interactive
+                           :backend backend
+                           :status 'idle
+                           :directory dir
+                           :session-id new-id
+                           :worktree-path (agents-workflow-agent-worktree-path src)
+                           :extra-directories (agents-workflow-agent-extra-directories src))))
+              (pcase backend
+                ('claude
+                 (agents-workflow--clone-session-files src-id new-id dir))
+                ('opencode
+                 ;; One-shot: start-opencode-interactive launches
+                 ;; `--session <src-id> --fork'.
+                 (puthash agent src-id agents-workflow--opencode-fork-pending)))
               (setf (agents-workflow-agents wf)
                     (append (agents-workflow-agents wf) (list agent)))
               (agents-workflow--start-agent agent wf)
               (agents-workflow--persist-workflow wf-name)
               (claude-dashboard-refresh-all)
-              (message "Forked %s -> %s (session %s)"
-                       row-id fork-name (substring new-id 0 8)))))))))
+              (message "Forked %s -> %s (from session %s)"
+                       row-id fork-name
+                       (substring src-id 0 (min 12 (length src-id)))))))))))
 
 (defun agents-workflow--restart-agent-with-dirs (agent workflow)
   "Kill and restart AGENT, preserving session-id with updated --add-dir flags."
+  ;; Codex agents may not have captured their id yet (it's resolved lazily,
+  ;; not on a launch timer).  Resolve it now from the live session's rollout
+  ;; — before the kill below — so the relaunch resumes instead of starting
+  ;; a fresh conversation.
+  (pcase (agents-workflow-agent-backend agent)
+    ('codex (agents-workflow--codex-capture-session-id
+             agent (agents-workflow-agent-directory agent)))
+    ('opencode (agents-workflow--opencode-capture-session-id
+                agent (agents-workflow-agent-directory agent))))
   (let ((buf (agents-workflow-agent-buffer agent)))
     ;; Kill existing buffer/process
     (when (and buf (buffer-live-p buf))
@@ -1742,31 +1801,44 @@ the text sent to the terminal."
    agents-workflow--registry))
 
 (defun agents-workflow--handle-codex-status (buffer status)
-  "Handle codex status change in BUFFER to STATUS.
-STATUS is `idle' or `working'.  Updates the corresponding agent."
+  "Handle codex/opencode status change in BUFFER to STATUS.
+STATUS is `idle' or `working'.  Updates the corresponding agent's
+visible status regardless of whether its workflow is running (matching
+the Claude title-watcher in `agents-workflow--handle-title-change', so
+the dashboard shows live status for codex/opencode agents even in a
+stopped workflow).  Trigger emission stays gated on a running workflow."
   (when (buffer-live-p buffer)
     (let ((buffer-name (buffer-name buffer)))
       (maphash
        (lambda (_name wf)
-         (when (eq (agents-workflow-state wf) 'running)
-           (when-let ((agent (agents-workflow--find-agent-by-buffer
-                              wf buffer-name)))
+         (when-let ((agent (agents-workflow--find-agent-by-buffer
+                            wf buffer-name)))
+           (let ((running (eq (agents-workflow-state wf) 'running)))
              (pcase status
                ('idle
                 (setf (agents-workflow-agent-status agent) 'waiting)
                 (setf (agents-workflow-agent-last-activity agent) (float-time))
-                (agents-workflow--emit wf
-                  `(:event worker-waiting
-                    :agent ,(agents-workflow-agent-name agent))))
+                ;; Last Output is delivered by the turn-end PUSH
+                ;; (codex `notify' / opencode plugin -> the
+                ;; `agents-workflow-handle-*-reply' receivers), not pulled
+                ;; here.  The pull helpers remain as an on-demand fallback.
+                (when running
+                  (agents-workflow--emit wf
+                    `(:event worker-waiting
+                      :agent ,(agents-workflow-agent-name agent)))))
                ('working
                 (setf (agents-workflow-agent-status agent) 'running)
                 (setf (agents-workflow-agent-last-activity agent) (float-time))
-                (agents-workflow--emit wf
-                  `(:event worker-running
-                    :agent ,(agents-workflow-agent-name agent))))))))
+                (when running
+                  (agents-workflow--emit wf
+                    `(:event worker-running
+                      :agent ,(agents-workflow-agent-name agent)))))))))
        agents-workflow--registry))))
 
 (add-hook 'codex-cli-status-change-functions #'agents-workflow--handle-codex-status)
+;; OpenCode reuses the same generic buffer->agent status handler as codex
+;; (it maps (BUFFER STATUS) to the owning agent; nothing codex-specific).
+(add-hook 'opencode-cli-status-change-functions #'agents-workflow--handle-codex-status)
 
 ;;;; Workflow lifecycle
 
@@ -1956,8 +2028,9 @@ Codex mints its own session id (unlike Claude's presettable
                 (throw 'found sid)))))))))
 
 (defun agents-workflow--codex-capture-session-id (agent dir)
-  "Capture AGENT's Codex session id from the rollout for DIR and persist it.
-No-op if AGENT already has a session-id or none is found yet."
+  "Resolve AGENT's Codex session id from the rollout for DIR and persist it.
+Called lazily at teardown (before a restart) rather than on a launch
+timer.  No-op if AGENT already has a session-id or none is found yet."
   (when (and (agents-workflow-agent-p agent)
              (not (agents-workflow-agent-session-id agent)))
     (when-let ((sid (agents-workflow--codex-latest-session-id dir)))
@@ -1965,12 +2038,239 @@ No-op if AGENT already has a session-id or none is found yet."
       (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
         (agents-workflow--persist-workflow (agents-workflow-name wf))))))
 
+(defun agents-workflow--opencode-capture-session-id (agent dir)
+  "Resolve AGENT's OpenCode session id from the project session list for DIR.
+Like the codex variant, resolved lazily at teardown (before a restart or
+on quit) rather than on a launch timer.  No-op if AGENT already has a
+session-id or none is found yet."
+  (when (and (agents-workflow-agent-p agent)
+             (not (agents-workflow-agent-session-id agent)))
+    (when-let ((sid (opencode-cli--latest-session-id-for-dir dir)))
+      (setf (agents-workflow-agent-session-id agent) sid)
+      (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+        (agents-workflow--persist-workflow (agents-workflow-name wf))))))
+
+;;;; Last-output capture (the model's actual reply, at turn end)
+
+(defun agents-workflow--last-sentence (text)
+  "Return the last sentence of TEXT (whitespace-flattened), length-capped.
+Used to render the tail of the model's reply in the Last Output column.
+Falls back to the whole flattened string when no sentence break is found."
+  (when (and text (not (string-empty-p (string-trim text))))
+    (let* ((flat (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " text)))
+           ;; Drop trailing terminators so the boundary search finds the one
+           ;; BEFORE the final sentence, then slice the final sentence off the
+           ;; original (keeping its own terminator).
+           (body (replace-regexp-in-string "[.!?]+\\'" "" flat))
+           (idx (string-match "[.!?][^.!?]*\\'" body))
+           (sentence (if idx (string-trim (substring flat (1+ idx))) flat)))
+      (if (> (length sentence) 200)
+          (concat (substring sentence 0 200) "…")
+        sentence))))
+
+(defun agents-workflow--set-last-output-sentence (agent msg)
+  "Store the last sentence of MSG as AGENT's last-output (if non-empty)."
+  (let ((s (agents-workflow--last-sentence msg)))
+    (when (and s (not (string-empty-p s)))
+      (setf (agents-workflow-agent-last-output agent) s))))
+
+(defun agents-workflow--codex-latest-rollout-file (dir)
+  "Return the newest Codex rollout file whose cwd is DIR, or nil."
+  (let ((root (expand-file-name "~/.codex/sessions"))
+        (target (file-truename (expand-file-name dir))))
+    (when (file-directory-p root)
+      (let ((files (sort (directory-files-recursively
+                          root "\\`rollout-.*\\.jsonl\\'")
+                         (lambda (a b)
+                           (time-less-p
+                            (file-attribute-modification-time (file-attributes b))
+                            (file-attribute-modification-time (file-attributes a)))))))
+        (catch 'found
+          (dolist (f files)
+            (when-let* ((line (agents-workflow--first-line f))
+                        (obj (ignore-errors (json-parse-string line)))
+                        ((hash-table-p obj))
+                        (payload (gethash "payload" obj))
+                        ((hash-table-p payload))
+                        (cwd (gethash "cwd" payload)))
+              (when (equal (file-truename (expand-file-name cwd)) target)
+                (throw 'found f)))))))))
+
+(defun agents-workflow--codex-last-assistant-message (dir)
+  "Return the text of Codex's most recent assistant message for DIR, or nil.
+Reads the tail of the newest matching rollout and returns the text of the
+last `role=assistant type=message' payload — the model's actual reply,
+with no TUI chrome."
+  (when-let ((file (agents-workflow--codex-latest-rollout-file dir)))
+    (ignore-errors
+      (with-temp-buffer
+        (let* ((size (file-attribute-size (file-attributes file)))
+               (start (if (and size (> size 262144)) (- size 262144) 0)))
+          (insert-file-contents file nil start size))
+        (let ((lines (nreverse (split-string (buffer-string) "\n" t)))
+              (result nil))
+          (catch 'done
+            (dolist (l lines)
+              (when-let* ((obj (ignore-errors (json-parse-string l)))
+                          ((hash-table-p obj))
+                          (p (gethash "payload" obj))
+                          ((hash-table-p p)))
+                (when (and (equal (gethash "role" p) "assistant")
+                           (equal (gethash "type" p) "message"))
+                  (let ((content (gethash "content" p)) (txt ""))
+                    (when (vectorp content)
+                      (dotimes (i (length content))
+                        (let ((c (aref content i)))
+                          (when (and (hash-table-p c) (stringp (gethash "text" c)))
+                            (setq txt (concat txt (gethash "text" c)))))))
+                    (unless (string-empty-p (string-trim txt))
+                      (setq result txt)
+                      (throw 'done nil)))))))
+          result)))))
+
+(defun agents-workflow--opencode-capture-last-message-async (agent)
+  "Fetch AGENT's last OpenCode assistant message via `opencode export'
+asynchronously, storing its last sentence as last-output and refreshing
+the dashboard.  Async so the ~1-2s CLI spin-up never blocks Emacs."
+  (let ((dir (agents-workflow-agent-directory agent)))
+    (unless (agents-workflow-agent-session-id agent)
+      (agents-workflow--opencode-capture-session-id agent dir))
+    (when-let* ((sid (agents-workflow-agent-session-id agent))
+                (prog (executable-find opencode-cli-program))
+                ((and dir (file-directory-p dir))))
+      (let ((out (generate-new-buffer " *aw-opencode-export*"))
+            (err (generate-new-buffer " *aw-opencode-export-err*"))
+            (default-directory (file-name-as-directory (expand-file-name dir))))
+        (make-process
+         :name "aw-opencode-export"
+         :buffer out
+         ;; Keep stderr ("Exporting session: …") out of the JSON buffer.
+         :stderr err
+         :noquery t
+         :command (list prog "export" sid)
+         :sentinel
+         (lambda (proc _event)
+           (when (memq (process-status proc) '(exit signal))
+             (unwind-protect
+                 (when (eq 0 (process-exit-status proc))
+                   (let ((json (with-current-buffer out (buffer-string))))
+                     (when-let ((msg (opencode-cli--export-last-assistant-text json)))
+                       (agents-workflow--set-last-output-sentence agent msg)
+                       (ignore-errors (claude-dashboard-refresh-all)))))
+               (when (buffer-live-p out) (kill-buffer out))
+               (when (buffer-live-p err) (kill-buffer err))))))))))
+
+(defun agents-workflow--capture-last-message (agent)
+  "Store AGENT's latest model reply (last sentence) as its last-output.
+Pulls the real assistant message from the backend's session storage — not
+the TUI — so the Last Output column shows the model's reply without chrome
+\(token usage, model name, status bar).  Meant to run once per turn, on the
+working->idle transition.  Codex reads its rollout synchronously; OpenCode
+exports asynchronously.  A no-op for other backends (claude uses its Stop
+hook)."
+  (pcase (agents-workflow-agent-backend agent)
+    ('codex
+     (when-let ((msg (agents-workflow--codex-last-assistant-message
+                      (agents-workflow-agent-directory agent))))
+       (agents-workflow--set-last-output-sentence agent msg)))
+    ('opencode
+     (agents-workflow--opencode-capture-last-message-async agent))))
+
+;;;; Turn-end PUSH receivers (codex `notify' / opencode plugin -> emacsclient)
+;;
+;; These are the efficient, event-driven analog of Claude Code's Stop hook
+;; (`claude-code-handle-hook'): instead of Emacs re-reading session storage,
+;; the CLI pushes the finished reply to Emacs at turn end.  The JSON/text is
+;; passed as a trailing emacsclient arg and arrives in `server-eval-args-left'.
+
+(defun agents-workflow--find-agent-by-dir (dir backend)
+  "Return the agent with BACKEND whose directory is DIR, or nil.
+On collisions (e.g. forks sharing a dir) the last match wins."
+  (let ((target (ignore-errors (file-truename (expand-file-name dir))))
+        (found nil))
+    (when target
+      (maphash
+       (lambda (_ wf)
+         (dolist (a (agents-workflow-agents wf))
+           (when (and (eq (agents-workflow-agent-backend a) backend)
+                      (equal (ignore-errors
+                               (file-truename
+                                (expand-file-name (agents-workflow-agent-directory a))))
+                             target))
+             (setq found a))))
+       agents-workflow--registry))
+    found))
+
+(defun agents-workflow--find-agent-by-session-id (sid)
+  "Return the agent whose session-id is SID, or nil."
+  (let ((found nil))
+    (when (and sid (stringp sid) (not (string-empty-p sid)))
+      (maphash
+       (lambda (_ wf)
+         (dolist (a (agents-workflow-agents wf))
+           (when (equal (agents-workflow-agent-session-id a) sid)
+             (setq found a))))
+       agents-workflow--registry))
+    found))
+
+(defun agents-workflow--mark-agent-idle-and-refresh (agent)
+  "Mark AGENT as awaiting input (turn ended) and refresh the dashboard.
+Emits `worker-waiting' only when the owning workflow is running."
+  (setf (agents-workflow-agent-status agent) 'waiting)
+  (setf (agents-workflow-agent-last-activity agent) (float-time))
+  (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+    (when (eq (agents-workflow-state wf) 'running)
+      (agents-workflow--emit wf
+        `(:event worker-waiting
+          :agent ,(agents-workflow-agent-name agent)))))
+  (ignore-errors (claude-dashboard-refresh-all)))
+
+(defun agents-workflow-handle-codex-reply (dir)
+  "Receive a Codex `agent-turn-complete' notification for cwd DIR.
+The event JSON (carrying `last-assistant-message') is passed as a trailing
+emacsclient arg and popped from `server-eval-args-left'.  Stores the last
+sentence of the reply as the matching codex agent's last-output and marks
+it idle.  Called from the codex `notify' wrapper."
+  (let ((json (when server-eval-args-left (pop server-eval-args-left))))
+    (setq server-eval-args-left nil)
+    (when-let ((agent (agents-workflow--find-agent-by-dir dir 'codex)))
+      (let ((msg (ignore-errors
+                   (let ((obj (json-parse-string json)))
+                     (and (hash-table-p obj)
+                          (gethash "last-assistant-message" obj))))))
+        (when (and (stringp msg) (not (string-empty-p (string-trim msg))))
+          (agents-workflow--set-last-output-sentence agent msg)))
+      (agents-workflow--mark-agent-idle-and-refresh agent)))
+  nil)
+
+(defun agents-workflow-handle-opencode-reply (session-id dir)
+  "Receive an OpenCode `session.idle' push for SESSION-ID in cwd DIR.
+The assistant reply text is passed as a trailing emacsclient arg and popped
+from `server-eval-args-left'.  Stores its last sentence as the matching
+opencode agent's last-output (matching by session-id, else by directory),
+backfills the agent's session-id, and marks it idle.  Called from the
+opencode plugin."
+  (let ((text (when server-eval-args-left (pop server-eval-args-left))))
+    (setq server-eval-args-left nil)
+    (when-let ((agent (or (agents-workflow--find-agent-by-session-id session-id)
+                          (agents-workflow--find-agent-by-dir dir 'opencode))))
+      (when (and (stringp session-id) (not (string-empty-p session-id))
+                 (not (agents-workflow-agent-session-id agent)))
+        (setf (agents-workflow-agent-session-id agent) session-id))
+      (when (and (stringp text) (not (string-empty-p (string-trim text))))
+        (agents-workflow--set-last-output-sentence agent text))
+      (agents-workflow--mark-agent-idle-and-refresh agent)))
+  nil)
+
 (defun agents-workflow--start-codex-interactive (agent)
   "Start interactive AGENT by creating a Codex eat terminal.
 If AGENT has a session-id, resume that Codex session via the `resume'
-subcommand.  Otherwise launch fresh and capture Codex's self-minted
-session id from its rollout once written, so later restarts/reloads can
-resume it (Codex, unlike Claude, does not accept a preset session id)."
+subcommand; otherwise launch fresh.  Codex mints its own id (no preset
+flag like Claude's --session-id), so rather than racing a timer to read
+the rollout after launch, the id is resolved lazily from the rollout at
+teardown — on quit (`agents-workflow-save-state') and just before a
+restart (`agents-workflow--restart-agent-with-dirs') — when the rollout
+is fully written and the newest one for this cwd is unambiguously ours."
   (let* ((dir (agents-workflow-agent-directory agent))
          (instance-name (agents-workflow-agent-name agent))
          (existing (codex-cli--find-buffers-for-directory dir))
@@ -1989,12 +2289,6 @@ resume it (Codex, unlike Claude, does not accept a preset session id)."
              (buffer (codex-cli--start dir instance-name resume-switches)))
         (when buffer
           (setf (agents-workflow-agent-buffer agent) buffer)
-          ;; Fresh launch: grab Codex's own session id from the rollout once
-          ;; it lands, so a future restart/reload can `codex resume' it.
-          (unless session-id
-            (run-at-time 10 nil
-                         #'agents-workflow--codex-capture-session-id
-                         agent dir))
           (let ((system-prompt (or (agents-workflow-agent-system-prompt agent)
                                    (agents-workflow--convention-system-prompt
                                     instance-name))))
@@ -2003,6 +2297,53 @@ resume it (Codex, unlike Claude, does not accept a preset session id)."
                            (lambda ()
                              (when (buffer-live-p buffer)
                                (codex-cli--send-command system-prompt buffer)))))))))))
+
+(defvar agents-workflow--opencode-fork-pending (make-hash-table :test 'eq)
+  "Map of AGENT struct -> source session id awaiting a one-shot fork launch.
+`agents-workflow--panel-fork-agent' populates this for OpenCode agents;
+`agents-workflow--start-opencode-interactive' consumes it exactly once,
+launching `opencode --session <src> --fork' so OpenCode mints a fresh
+forked session (whose own id is captured lazily at teardown).")
+
+(defun agents-workflow--start-opencode-interactive (agent)
+  "Start interactive AGENT by creating an OpenCode eat terminal.
+Launch semantics, in order:
+- Fork-pending (set by `agents-workflow--panel-fork-agent'): launch
+  `opencode --session <src-id> --fork' once, then clear the marker.
+- Has session-id: resume it via `--session <id>'.
+- Otherwise: launch fresh (OpenCode mints its own ses_... id, resolved
+  lazily at teardown, mirroring codex)."
+  (let* ((dir (agents-workflow-agent-directory agent))
+         (instance-name (agents-workflow-agent-name agent))
+         (existing (opencode-cli--find-buffers-for-directory dir))
+         (matching (cl-find-if
+                    (lambda (buf)
+                      (equal (opencode-cli--extract-instance-name
+                              (buffer-name buf))
+                             instance-name))
+                    existing)))
+    (if matching
+        (setf (agents-workflow-agent-buffer agent) matching)
+      (let* ((fork-src (gethash agent agents-workflow--opencode-fork-pending))
+             (session-id (agents-workflow-agent-session-id agent))
+             (launch-switches
+              (cond
+               (fork-src (list "--session" fork-src "--fork"))
+               (session-id (list "--session" session-id))
+               (t nil)))
+             (buffer (opencode-cli--start dir instance-name launch-switches)))
+        (when fork-src
+          (remhash agent agents-workflow--opencode-fork-pending))
+        (when buffer
+          (setf (agents-workflow-agent-buffer agent) buffer)
+          (let ((system-prompt (or (agents-workflow-agent-system-prompt agent)
+                                   (agents-workflow--convention-system-prompt
+                                    instance-name))))
+            (when system-prompt
+              (run-at-time 3 nil
+                           (lambda ()
+                             (when (buffer-live-p buffer)
+                               (opencode-cli--send-command system-prompt buffer)))))))))))
 
 (defun agents-workflow--resolve-context-file (workflow)
   "Return the absolute path to WORKFLOW's context file, or nil."
@@ -2114,6 +2455,7 @@ If WORKFLOW is provided, send its context file to the agent on startup."
      (pcase (agents-workflow-agent-backend agent)
        ('claude (agents-workflow--start-claude-interactive agent))
        ('codex  (agents-workflow--start-codex-interactive agent))
+       ('opencode (agents-workflow--start-opencode-interactive agent))
        (_ (error "Unknown backend: %s" (agents-workflow-agent-backend agent))))
      (agents-workflow--install-title-watcher agent)
      ;; Offer to send shared context file unless agent has its own system prompt
@@ -2397,7 +2739,19 @@ including dynamically-added ones."
                        ;; Try to extract session-id from live process if not already set
                        (let ((sid (or (agents-workflow-agent-session-id agent)
                                       (when-let ((buf (agents-workflow-agent-buffer agent)))
-                                        (agents-workflow--extract-session-id-from-process buf)))))
+                                        (agents-workflow--extract-session-id-from-process buf))
+                                      ;; Codex mints its own id and carries no
+                                      ;; --session-id flag, so the process-args
+                                      ;; path above can't recover it (and the
+                                      ;; one-shot capture timer may have missed
+                                      ;; the rollout).  Fall back to the newest
+                                      ;; rollout whose cwd matches the agent's
+                                      ;; directory — works even with a dead buffer.
+                                      (pcase (agents-workflow-agent-backend agent)
+                                        ('codex (agents-workflow--codex-latest-session-id
+                                                 (agents-workflow-agent-directory agent)))
+                                        ('opencode (opencode-cli--latest-session-id-for-dir
+                                                    (agents-workflow-agent-directory agent)))))))
                          (when sid
                            (setf (agents-workflow-agent-session-id agent) sid)
                            (setq entry (plist-put entry :session-id sid))))

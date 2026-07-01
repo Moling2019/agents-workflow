@@ -76,6 +76,16 @@ to `idle'."
   :type 'number
   :group 'codex-cli)
 
+(defcustom codex-cli-working-regexp "esc[^\n]*interrupt"
+  "Regexp (case-insensitive) matching Codex's active-turn indicator.
+Codex renders \"Working (… esc to interrupt)\" only while a turn is
+running, so the interrupt hint is a reliable \"actively working\" signal
+— the TUI analog of Claude Code's title spinner.  Status is set to
+`working' only when this pattern is visible on screen; without it, the
+session settles to `idle' after `codex-cli-idle-delay' of silence."
+  :type 'regexp
+  :group 'codex-cli)
+
 ;;;; Faces
 
 (defface codex-cli-header-line
@@ -274,23 +284,38 @@ When the timer fires, the status changes to `idle'."
       (add-hook 'kill-buffer-hook
                 #'codex-cli--cancel-idle-timer nil t))))
 
+(defun codex-cli--working-p ()
+  "Return non-nil if the visible screen shows Codex's active-turn indicator.
+Scans the tail of the current buffer (the on-screen region) for
+`codex-cli-working-regexp'."
+  (let ((start (max (point-min) (- (point-max) 4000)))
+        (case-fold-search t))
+    (string-match-p codex-cli-working-regexp
+                    (buffer-substring-no-properties start (point-max)))))
+
 (defun codex-cli--on-output (buffer)
-  "Handle new terminal output in BUFFER — reset the idle timer."
+  "Handle new terminal output in BUFFER.
+Marks the session `working' only while the interrupt hint is on screen
+\(a real active-turn signal, not mere redraw activity); (re)arms the
+silence timer that settles the session to `idle'."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      ;; Cancel existing timer
       (codex-cli--cancel-idle-timer)
-      ;; If currently idle, transition to working
-      (when (eq codex-cli--status 'idle)
+      (when (and (codex-cli--working-p)
+                 (not (eq codex-cli--status 'working)))
         (setq codex-cli--status 'working)
         (run-hook-with-args 'codex-cli-status-change-functions buffer 'working))
-      ;; Schedule idle transition
+      ;; Any output resets the silence timer.  While a turn is active
+      ;; Codex updates its elapsed-time counter every second, so the timer
+      ;; keeps resetting; when the turn ends, output stops and it fires.
       (setq codex-cli--idle-timer
             (run-at-time codex-cli-idle-delay nil
                          #'codex-cli--idle-timer-fired buffer)))))
 
 (defun codex-cli--idle-timer-fired (buffer)
-  "Called when BUFFER has had no output for `codex-cli-idle-delay' seconds."
+  "Called when BUFFER has had no output for `codex-cli-idle-delay' seconds.
+Sustained silence means the turn ended (or the interrupt hint got stuck
+with no further updates) — either way, settle to `idle'."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq codex-cli--idle-timer nil)
