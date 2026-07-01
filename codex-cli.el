@@ -241,7 +241,11 @@ BUFFER defaults to current buffer."
   (let ((buf (or buffer (current-buffer))))
     (with-current-buffer buf
       (when (bound-and-true-p eat-terminal)
-        (eat-term-send-string eat-terminal (concat cmd "\n"))
+        ;; The TUI composer submits on Enter (CR); a bare LF ("\n") is
+        ;; treated as a newline in the input box and never sends.  Send the
+        ;; text, then an explicit CR to submit.
+        (eat-term-send-string eat-terminal cmd)
+        (eat-term-send-string eat-terminal "\r")
         (run-hook-with-args 'codex-cli-status-change-functions buf 'working)))))
 
 ;;;; Process management
