@@ -98,18 +98,21 @@ session settles to `idle' after `opencode-cli-idle-delay' of silence
   :type 'regexp
   :group 'opencode-cli)
 
-(defcustom opencode-cli-scroll-keybindings
+(defcustom opencode-cli-keybindings
   '(("C->" . "\e[F")    ; ctrl+shift+> -> End      -> messages_last  (jump to bottom)
     ("C-<" . "\e[H")    ; ctrl+shift+< -> Home     -> messages_first (jump to top)
     ("C-u" . "\e[5~")   ; ctrl+u       -> PageUp   -> messages_page_up
-    ("C-n" . "\e[6~"))  ; ctrl+n       -> PageDown -> messages_page_down
-  "Keyboard scroll bindings for OpenCode eat buffers, as (KEY . SEQUENCE).
+    ("C-n" . "\e[6~")   ; ctrl+n       -> PageDown -> messages_page_down
+    ("C-g" . "\e"))     ; ctrl+g       -> Esc      -> cancel/interrupt (mirrors keyboard-quit)
+  "Keyboard bindings for OpenCode eat buffers, as (KEY . SEQUENCE).
 KEY is a `kbd' string bound with precedence over eat's key-forwarding in
 OpenCode buffers; SEQUENCE is the raw terminal escape sent to OpenCode.
-The defaults map to OpenCode's own default keybinds (End/Home/PageUp/
-PageDown = messages_last/first/page_up/page_down), so you can scroll by
-keyboard instead of the trackpad.  Intercepting in Emacs and sending the
-escape avoids the terminal's inability to encode ctrl+shift+<punct>."
+Defaults cover scrolling (End/Home/PageUp/PageDown = messages_last/first/
+page_up/page_down) and cancel: C-g sends a single Esc, so — like Emacs's
+`keyboard-quit' — it aborts the current OpenCode operation (press twice for
+OpenCode's double-Esc interrupt, exactly as with the Esc key).  Intercepting
+in Emacs and sending the escape avoids the terminal's inability to encode
+ctrl+shift+<punct>."
   :type '(alist :key-type string :value-type string)
   :group 'opencode-cli)
 
@@ -255,7 +258,7 @@ Returns the buffer, or nil if creation failed."
         (claude-code--term-customize-faces claude-code-terminal-backend)
         (opencode-cli--setup-buffer-appearance)
         (opencode-cli--apply-cursor-visibility)
-        (opencode-cli--install-scroll-keys)
+        (opencode-cli--install-keybindings)
         (run-hooks 'claude-code-start-hook))
       (opencode-cli--install-idle-timer buffer)
       buffer)))
@@ -311,17 +314,17 @@ re-apply the invisible-cursor state."
 
 ;;;; Keyboard scrolling
 
-(defun opencode-cli--install-scroll-keys ()
-  "Bind `opencode-cli-scroll-keybindings' in the current OpenCode eat buffer.
+(defun opencode-cli--install-keybindings ()
+  "Bind `opencode-cli-keybindings' in the current OpenCode eat buffer.
 Installs them via `minor-mode-overriding-map-alist' for `eat--semi-char-mode'
 so they take precedence over eat's key-forwarding for this buffer only; a
 parent keymap of `eat-semi-char-mode-map' lets every other key fall through
 to eat unchanged.  Each binding sends its escape SEQUENCE straight to
-OpenCode, matching OpenCode's default scroll keybinds."
+OpenCode (its default scroll keys, plus Esc for cancel/interrupt)."
   (when (boundp 'eat-semi-char-mode-map)
     (let ((map (make-sparse-keymap)))
       (set-keymap-parent map eat-semi-char-mode-map)
-      (dolist (kv opencode-cli-scroll-keybindings)
+      (dolist (kv opencode-cli-keybindings)
         (let ((seq (cdr kv)))
           (define-key map (kbd (car kv))
             (lambda ()
