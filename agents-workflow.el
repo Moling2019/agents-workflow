@@ -2254,9 +2254,17 @@ opencode plugin."
     (setq server-eval-args-left nil)
     (when-let ((agent (or (agents-workflow--find-agent-by-session-id session-id)
                           (agents-workflow--find-agent-by-dir dir 'opencode))))
+      ;; Always track the CURRENT live session id (not just backfill when
+      ;; nil).  OpenCode can move an agent onto a new session; if we only
+      ;; set it once, the stored id goes stale and quit/restart resumes the
+      ;; wrong (old) session, orphaning the current one.  Persist on change
+      ;; so the resume survives a full quit/restart.
       (when (and (stringp session-id) (not (string-empty-p session-id))
-                 (not (agents-workflow-agent-session-id agent)))
-        (setf (agents-workflow-agent-session-id agent) session-id))
+                 (not (equal (agents-workflow-agent-session-id agent) session-id)))
+        (setf (agents-workflow-agent-session-id agent) session-id)
+        (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+          (ignore-errors
+            (agents-workflow--persist-workflow (agents-workflow-name wf)))))
       (when (and (stringp text) (not (string-empty-p (string-trim text))))
         (agents-workflow--set-last-output-sentence agent text))
       (agents-workflow--mark-agent-idle-and-refresh agent)))
