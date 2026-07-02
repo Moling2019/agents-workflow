@@ -3,12 +3,18 @@
 #
 # Codex invokes this on `agent-turn-complete', appending the event JSON
 # (which includes `last-assistant-message') as the final argument, and the
-# process inherits Codex's working directory (= the agent's directory).
-# We push the finished reply to Emacs, mirroring Claude Code's Stop hook:
-# the JSON is passed as a trailing emacsclient arg and read from
-# `server-eval-args-left' by `agents-workflow-handle-codex-reply'.
+# process inherits Codex's environment + working directory.  We push the
+# finished reply to Emacs, mirroring Claude Code's Stop hook: the JSON is
+# passed as a trailing emacsclient arg and read from `server-eval-args-left'
+# by `agents-workflow-handle-codex-reply'.  The agent identity
+# (AGENTS_WORKFLOW_AGENT / AGENTS_WORKFLOW_NAME, exported by agents-workflow
+# at launch) is forwarded so the push routes to the right agent even when
+# several codex agents share one worktree; PWD is a fallback.
 json="$1"
 [ -z "$json" ] && exit 0
-dir="${PWD//\\/\\\\}"; dir="${dir//\"/\\\"}"
-emacsclient --eval "(agents-workflow-handle-codex-reply \"$dir\")" "$json" >/dev/null 2>&1 || true
+esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+dir="$(esc "$PWD")"
+agent="$(esc "${AGENTS_WORKFLOW_AGENT:-}")"
+wf="$(esc "${AGENTS_WORKFLOW_NAME:-}")"
+emacsclient --eval "(agents-workflow-handle-codex-reply \"$dir\" \"$agent\" \"$wf\")" "$json" >/dev/null 2>&1 || true
 exit 0

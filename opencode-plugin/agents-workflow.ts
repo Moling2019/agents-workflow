@@ -5,8 +5,11 @@
 // extra `opencode export' process) and forwards it to Emacs, mirroring
 // Claude Code's Stop hook.  The text is passed as a trailing emacsclient
 // arg and read from `server-eval-args-left' by
-// `agents-workflow-handle-opencode-reply'.  Harmless no-op when Emacs isn't
-// running or no matching agent exists.
+// `agents-workflow-handle-opencode-reply'.  The agent identity
+// (AGENTS_WORKFLOW_AGENT / AGENTS_WORKFLOW_NAME, set by agents-workflow at
+// launch) is forwarded too, so the push routes to the right agent even when
+// several opencode agents share one worktree.  Harmless no-op when Emacs
+// isn't running or no matching agent exists.
 import type { Plugin } from "@opencode-ai/plugin"
 
 export const AgentsWorkflow: Plugin = async ({ client, $, directory }) => {
@@ -29,9 +32,12 @@ export const AgentsWorkflow: Plugin = async ({ client, $, directory }) => {
           }
         }
       } catch (_) { /* ignore fetch errors */ }
+      const agent = process.env.AGENTS_WORKFLOW_AGENT ?? ""
+      const wf = process.env.AGENTS_WORKFLOW_NAME ?? ""
       const form =
         `(agents-workflow-handle-opencode-reply ` +
-        `${JSON.stringify(sessionID)} ${JSON.stringify(directory ?? "")})`
+        `${JSON.stringify(sessionID)} ${JSON.stringify(directory ?? "")} ` +
+        `${JSON.stringify(agent)} ${JSON.stringify(wf)})`
       try {
         await $`emacsclient --eval ${form} ${text}`.quiet().nothrow()
       } catch (_) { /* emacs not running / no emacsclient */ }

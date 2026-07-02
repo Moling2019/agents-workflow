@@ -2213,6 +2213,17 @@ On collisions (e.g. forks sharing a dir) the last match wins."
        agents-workflow--registry))
     found))
 
+(defun agents-workflow--find-agent-globally (wf-name agent-name)
+  "Return the agent named AGENT-NAME in workflow WF-NAME, or nil.
+Routes turn-end pushes by the agent identity threaded through the launch
+environment (AGENTS_WORKFLOW_NAME / AGENTS_WORKFLOW_AGENT).  Unlike matching
+by directory, this is unambiguous when several agents share one worktree —
+mirroring how Claude keys off CLAUDE_BUFFER_NAME."
+  (when (and (stringp wf-name) (not (string-empty-p wf-name))
+             (stringp agent-name) (not (string-empty-p agent-name)))
+    (when-let ((wf (agents-workflow--get wf-name)))
+      (agents-workflow--find-agent-by-name wf agent-name))))
+
 (defun agents-workflow--mark-agent-idle-and-refresh (agent)
   "Mark AGENT as awaiting input (turn ended) and refresh the dashboard.
 Emits `worker-waiting' only when the owning workflow is running."
@@ -2225,15 +2236,17 @@ Emits `worker-waiting' only when the owning workflow is running."
           :agent ,(agents-workflow-agent-name agent)))))
   (ignore-errors (claude-dashboard-refresh-all)))
 
-(defun agents-workflow-handle-codex-reply (dir)
+(defun agents-workflow-handle-codex-reply (dir &optional agent-name wf-name)
   "Receive a Codex `agent-turn-complete' notification for cwd DIR.
 The event JSON (carrying `last-assistant-message') is passed as a trailing
-emacsclient arg and popped from `server-eval-args-left'.  Stores the last
-sentence of the reply as the matching codex agent's last-output and marks
-it idle.  Called from the codex `notify' wrapper."
+emacsclient arg and popped from `server-eval-args-left'.  Routes to the
+agent by (WF-NAME, AGENT-NAME) when the notify wrapper supplies them —
+unambiguous even with several codex agents in one worktree — falling back
+to DIR.  Stores the reply's last sentence as last-output and marks it idle."
   (let ((json (when server-eval-args-left (pop server-eval-args-left))))
     (setq server-eval-args-left nil)
-    (when-let ((agent (agents-workflow--find-agent-by-dir dir 'codex)))
+    (when-let ((agent (or (agents-workflow--find-agent-globally wf-name agent-name)
+                          (agents-workflow--find-agent-by-dir dir 'codex))))
       (let ((msg (ignore-errors
                    (let ((obj (json-parse-string json)))
                      (and (hash-table-p obj)
@@ -2243,16 +2256,17 @@ it idle.  Called from the codex `notify' wrapper."
       (agents-workflow--mark-agent-idle-and-refresh agent)))
   nil)
 
-(defun agents-workflow-handle-opencode-reply (session-id dir)
+(defun agents-workflow-handle-opencode-reply (session-id dir &optional agent-name wf-name)
   "Receive an OpenCode `session.idle' push for SESSION-ID in cwd DIR.
 The assistant reply text is passed as a trailing emacsclient arg and popped
-from `server-eval-args-left'.  Stores its last sentence as the matching
-opencode agent's last-output (matching by session-id, else by directory),
-backfills the agent's session-id, and marks it idle.  Called from the
-opencode plugin."
+from `server-eval-args-left'.  Routes to the agent by (WF-NAME, AGENT-NAME)
+when the plugin supplies them — unambiguous with several opencode agents in
+one worktree — then by SESSION-ID, then by DIR.  Tracks the agent's current
+session-id, stores the reply's last sentence as last-output, marks it idle."
   (let ((text (when server-eval-args-left (pop server-eval-args-left))))
     (setq server-eval-args-left nil)
-    (when-let ((agent (or (agents-workflow--find-agent-by-session-id session-id)
+    (when-let ((agent (or (agents-workflow--find-agent-globally wf-name agent-name)
+                          (agents-workflow--find-agent-by-session-id session-id)
                           (agents-workflow--find-agent-by-dir dir 'opencode))))
       ;; Always track the CURRENT live session id (not just backfill when
       ;; nil).  OpenCode can move an agent onto a new session; if we only
@@ -2294,6 +2308,16 @@ is fully written and the newest one for this cwd is unambiguously ours."
              ;; `resume <id>' is a subcommand; the base global switches
              ;; (sandbox, --no-alt-screen) legitimately precede it.
              (resume-switches (when session-id (list "resume" session-id)))
+             (wf (agents-workflow--find-workflow-for-agent agent))
+             ;; Thread agent identity into the env so the `notify' wrapper
+             ;; (a subprocess of codex, which inherits this) can route the
+             ;; turn-end push back to THIS agent even when several share a
+             ;; worktree (the Claude CLAUDE_BUFFER_NAME pattern).
+             (process-environment
+              (append (list (format "AGENTS_WORKFLOW_AGENT=%s" instance-name)
+                            (format "AGENTS_WORKFLOW_NAME=%s"
+                                    (if wf (agents-workflow-name wf) "")))
+                      process-environment))
              (buffer (codex-cli--start dir instance-name resume-switches)))
         (when buffer
           (setf (agents-workflow-agent-buffer agent) buffer)
@@ -2339,6 +2363,16 @@ Launch semantics, in order:
                (fork-src (list "--session" fork-src "--fork"))
                (session-id (list "--session" session-id))
                (t nil)))
+             (wf (agents-workflow--find-workflow-for-agent agent))
+             ;; Thread agent identity into the env so the opencode plugin
+             ;; (running inside this opencode process) can route the
+             ;; session.idle push back to THIS agent even when several share
+             ;; a worktree (the Claude CLAUDE_BUFFER_NAME pattern).
+             (process-environment
+              (append (list (format "AGENTS_WORKFLOW_AGENT=%s" instance-name)
+                            (format "AGENTS_WORKFLOW_NAME=%s"
+                                    (if wf (agents-workflow-name wf) "")))
+                      process-environment))
              (buffer (opencode-cli--start dir instance-name launch-switches)))
         (when fork-src
           (remhash agent agents-workflow--opencode-fork-pending))
