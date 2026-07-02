@@ -98,6 +98,21 @@ session settles to `idle' after `opencode-cli-idle-delay' of silence
   :type 'regexp
   :group 'opencode-cli)
 
+(defcustom opencode-cli-scroll-keybindings
+  '(("C->" . "\e[F")    ; ctrl+shift+> -> End      -> messages_last  (jump to bottom)
+    ("C-<" . "\e[H")    ; ctrl+shift+< -> Home     -> messages_first (jump to top)
+    ("C-u" . "\e[5~")   ; ctrl+u       -> PageUp   -> messages_page_up
+    ("C-n" . "\e[6~"))  ; ctrl+n       -> PageDown -> messages_page_down
+  "Keyboard scroll bindings for OpenCode eat buffers, as (KEY . SEQUENCE).
+KEY is a `kbd' string bound with precedence over eat's key-forwarding in
+OpenCode buffers; SEQUENCE is the raw terminal escape sent to OpenCode.
+The defaults map to OpenCode's own default keybinds (End/Home/PageUp/
+PageDown = messages_last/first/page_up/page_down), so you can scroll by
+keyboard instead of the trackpad.  Intercepting in Emacs and sending the
+escape avoids the terminal's inability to encode ctrl+shift+<punct>."
+  :type '(alist :key-type string :value-type string)
+  :group 'opencode-cli)
+
 ;;;; Faces
 
 (defface opencode-cli-header-line
@@ -240,6 +255,7 @@ Returns the buffer, or nil if creation failed."
         (claude-code--term-customize-faces claude-code-terminal-backend)
         (opencode-cli--setup-buffer-appearance)
         (opencode-cli--apply-cursor-visibility)
+        (opencode-cli--install-scroll-keys)
         (run-hooks 'claude-code-start-hook))
       (opencode-cli--install-idle-timer buffer)
       buffer)))
@@ -292,6 +308,30 @@ re-apply the invisible-cursor state."
   (when (bound-and-true-p eat--cursor-blink-mode)
     (eat--cursor-blink-mode -1))
   (eat--set-cursor nil :invisible))
+
+;;;; Keyboard scrolling
+
+(defun opencode-cli--install-scroll-keys ()
+  "Bind `opencode-cli-scroll-keybindings' in the current OpenCode eat buffer.
+Installs them via `minor-mode-overriding-map-alist' for `eat--semi-char-mode'
+so they take precedence over eat's key-forwarding for this buffer only; a
+parent keymap of `eat-semi-char-mode-map' lets every other key fall through
+to eat unchanged.  Each binding sends its escape SEQUENCE straight to
+OpenCode, matching OpenCode's default scroll keybinds."
+  (when (boundp 'eat-semi-char-mode-map)
+    (let ((map (make-sparse-keymap)))
+      (set-keymap-parent map eat-semi-char-mode-map)
+      (dolist (kv opencode-cli-scroll-keybindings)
+        (let ((seq (cdr kv)))
+          (define-key map (kbd (car kv))
+            (lambda ()
+              (interactive)
+              (when (bound-and-true-p eat-terminal)
+                (eat-term-send-string eat-terminal seq))))))
+      (setq-local minor-mode-overriding-map-alist
+                  (cons (cons 'eat--semi-char-mode map)
+                        (and (boundp 'minor-mode-overriding-map-alist)
+                             minor-mode-overriding-map-alist))))))
 
 ;;;; Sending commands
 
