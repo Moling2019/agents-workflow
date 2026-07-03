@@ -19,10 +19,14 @@
 (require 'claude-dashboard)
 (require 'codex-cli)
 (require 'opencode-cli)
+(require 'omp-cli)
 
 ;; Forward declaration; initialized (with a hash-table) near
 ;; `agents-workflow--start-opencode-interactive'.
 (defvar agents-workflow--opencode-fork-pending)
+;; Forward declaration; initialized near
+;; `agents-workflow--start-omp-interactive'.
+(defvar agents-workflow--omp-fork-pending)
 ;; Dynamic var from the `server' package; the turn-end push receivers read
 ;; the trailing emacsclient arg from it (same mechanism as claude-code).
 (defvar server-eval-args-left)
@@ -148,12 +152,18 @@ FEATURE is the symbol to `require' if the constructor is not yet loaded.")
      ((interactive :icon "code"    :face (:foreground "#10a37f"))
       (configured  :icon "tune"    :face (:foreground "#74aa9c"))
       (autonomous  :icon "android" :face (:foreground "#10a37f"))))
-    (opencode
-     :title-idle-pattern nil
-     :dashboard-types
-     ((interactive :icon "developer_board" :face (:foreground "#f2c14e"))
-      (configured  :icon "tune"            :face (:foreground "#f2c14e"))
-      (autonomous  :icon "toys"            :face (:foreground "#f2c14e")))))
+     (opencode
+      :title-idle-pattern nil
+      :dashboard-types
+      ((interactive :icon "developer_board" :face (:foreground "#f2c14e"))
+       (configured  :icon "tune"            :face (:foreground "#f2c14e"))
+       (autonomous  :icon "toys"            :face (:foreground "#f2c14e"))))
+     (omp
+      :title-idle-pattern nil
+      :dashboard-types
+      ((interactive :icon "developer_board" :face (:foreground "#c678dd"))
+       (configured  :icon "tune"            :face (:foreground "#c678dd"))
+       (autonomous  :icon "toys"            :face (:foreground "#c678dd")))))
   "Backend registry mapping symbols to configuration plists.
 Program and switches are managed via defcustoms, not stored here.")
 
@@ -167,6 +177,7 @@ Program and switches are managed via defcustoms, not stored here.")
     ('claude claude-code-program)
     ('codex  codex-cli-program)
     ('opencode opencode-cli-program)
+    ('omp omp-cli-program)
     (_ (error "Unknown backend: %s" backend))))
 
 (defun agents-workflow--backend-base-switches (backend)
@@ -175,6 +186,7 @@ Program and switches are managed via defcustoms, not stored here.")
     ('claude claude-code-program-switches)
     ('codex  codex-cli-program-switches)
     ('opencode opencode-cli-program-switches)
+    ('omp omp-cli-program-switches)
     (_ nil)))
 
 (defun agents-workflow--backend-type-config (backend type)
@@ -807,6 +819,8 @@ via after-advice so the side panel follows your focus."
      (codex-cli--send-command cmd buffer))
     ('opencode
      (opencode-cli--send-command cmd buffer))
+    ('omp
+     (omp-cli--send-command cmd buffer))
     (_ (error "Unknown backend: %s" (agents-workflow-agent-backend agent)))))
 
 (defun agents-workflow--ensure-agent-buffer (agent)
@@ -832,6 +846,10 @@ the live buffer or nil."
                  (when (fboundp 'opencode-cli--find-buffers-for-directory)
                    (or (opencode-cli--find-buffers-for-directory dir)
                        (opencode-cli--find-buffers))))
+                ('omp
+                 (when (fboundp 'omp-cli--find-buffers-for-directory)
+                   (or (omp-cli--find-buffers-for-directory dir)
+                       (omp-cli--find-buffers))))
                 (_ ; claude (default)
                  (when (fboundp 'claude-code--find-claude-buffers-for-directory)
                    (or (claude-code--find-claude-buffers-for-directory dir)
@@ -840,6 +858,7 @@ the live buffer or nil."
               (pcase backend
                 ('codex #'codex-cli--extract-instance-name)
                 ('opencode #'opencode-cli--extract-instance-name)
+                ('omp #'omp-cli--extract-instance-name)
                 (_ #'claude-code--extract-instance-name-from-buffer-name)))
              (matching (cl-find-if
                         (lambda (b)
@@ -908,6 +927,8 @@ If no buffer exists at all, offer to relaunch the agent."
                                         (codex-cli--find-buffers)))
                               ('opencode (when (fboundp 'opencode-cli--find-buffers)
                                            (opencode-cli--find-buffers)))
+                              ('omp (when (fboundp 'omp-cli--find-buffers)
+                                      (omp-cli--find-buffers)))
                               (_ (when (fboundp 'claude-code--find-all-claude-buffers)
                                    (claude-code--find-all-claude-buffers)))))
                  (buf-names (mapcar #'buffer-name all-bufs)))
@@ -1060,7 +1081,7 @@ the user chose to use the base directory directly."
         (user-error "Agent name cannot be empty"))
       (when (agents-workflow--find-agent-by-name wf name)
         (user-error "Agent %s already exists" name))
-      (let* ((backend-str (completing-read "Backend: " '("claude" "codex" "opencode") nil t nil nil "claude"))
+      (let* ((backend-str (completing-read "Backend: " '("claude" "codex" "opencode" "omp") nil t nil nil "claude"))
              (backend (intern backend-str))
              (wf-dir (agents-workflow-directory wf))
              (base-dir (let ((dir-choice (completing-read
@@ -1133,6 +1154,8 @@ Per-backend fork mechanism:
             preset that id via --session-id.
 - opencode: capture the source ses_... id and let OpenCode mint a forked
             session via `opencode --session <src> --fork'.
+- omp:      resume the source session via `omp --resume <src>'; omp
+            writes new turns to a new session file, preserving the original.
 - codex:    not supported (Codex has no fork primitive)."
   (when-let* ((wf (agents-workflow--get wf-name))
               (src (agents-workflow--find-agent-by-name wf row-id)))
@@ -1147,11 +1170,15 @@ Per-backend fork mechanism:
 Fix the workflow .eld file before forking — the cloned agent would
 inherit the same broken path and produce an empty buffer"
                     src-dir))
-      ;; Resolve the source session id.  For opencode it may not be
+      ;; Resolve the source session id.  For opencode/omp it may not be
       ;; captured yet (resolved lazily), so try a capture first.
-      (when (and (eq backend 'opencode)
-                 (not (agents-workflow-agent-session-id src)))
-        (agents-workflow--opencode-capture-session-id src src-dir))
+      (when (and (memq backend '(opencode omp))
+                  (not (agents-workflow-agent-session-id src)))
+        (cond
+         ((eq backend 'opencode)
+          (agents-workflow--opencode-capture-session-id src src-dir))
+         ((eq backend 'omp)
+          (agents-workflow--omp-capture-session-id src src-dir))))
       (let ((src-id (agents-workflow-agent-session-id src)))
         (unless src-id
           (user-error "Source agent has no session-id yet — start it and send at least one message first"))
@@ -1188,9 +1215,16 @@ inherit the same broken path and produce an empty buffer"
                 ('claude
                  (agents-workflow--clone-session-files src-id new-id dir))
                 ('opencode
-                 ;; One-shot: start-opencode-interactive launches
-                 ;; `--session <src-id> --fork'.
-                 (puthash agent src-id agents-workflow--opencode-fork-pending)))
+                  ;; One-shot: start-opencode-interactive launches
+                  ;; `--session <src-id> --fork'.
+                  (puthash agent src-id agents-workflow--opencode-fork-pending))
+                ('omp
+                  ;; omp has no native fork flag.  Resume the source
+                  ;; session with `--resume <src-id>' — omp creates a
+                  ;; new session file, so the original is preserved
+                  ;; (effectively a fork).  If this proves not to fork
+                  ;; correctly, fall back to file-copy + --resume.
+                  (puthash agent src-id agents-workflow--omp-fork-pending)))
               (setf (agents-workflow-agents wf)
                     (append (agents-workflow-agents wf) (list agent)))
               (agents-workflow--start-agent agent wf)
@@ -1209,8 +1243,10 @@ inherit the same broken path and produce an empty buffer"
   (pcase (agents-workflow-agent-backend agent)
     ('codex (agents-workflow--codex-capture-session-id
              agent (agents-workflow-agent-directory agent)))
-    ('opencode (agents-workflow--opencode-capture-session-id
-                agent (agents-workflow-agent-directory agent))))
+     ('opencode (agents-workflow--opencode-capture-session-id
+                 agent (agents-workflow-agent-directory agent)))
+     ('omp (agents-workflow--omp-capture-session-id
+            agent (agents-workflow-agent-directory agent))))
   (let ((buf (agents-workflow-agent-buffer agent)))
     ;; Kill existing buffer/process
     (when (and buf (buffer-live-p buf))
@@ -1814,15 +1850,19 @@ stopped workflow).  Trigger emission stays gated on a running workflow."
          (when-let ((agent (agents-workflow--find-agent-by-buffer
                             wf buffer-name)))
            (let ((running (eq (agents-workflow-state wf) 'running)))
-             (pcase status
-               ('idle
-                (setf (agents-workflow-agent-status agent) 'waiting)
-                (setf (agents-workflow-agent-last-activity agent) (float-time))
-                ;; Last Output is delivered by the turn-end PUSH
-                ;; (codex `notify' / opencode plugin -> the
-                ;; `agents-workflow-handle-*-reply' receivers), not pulled
-                ;; here.  The pull helpers remain as an on-demand fallback.
-                (when running
+              (pcase status
+                ('idle
+                 (setf (agents-workflow-agent-status agent) 'waiting)
+                 (setf (agents-workflow-agent-last-activity agent) (float-time))
+                 ;; Last Output is delivered by the turn-end PUSH
+                 ;; (codex `notify' / opencode plugin -> the
+                 ;; `agents-workflow-handle-*-reply' receivers), not pulled
+                 ;; here.  The pull helpers remain as an on-demand fallback.
+                 ;; For omp, the hook push may not fire if the event API
+                 ;; differs, so trigger the async capture as a fallback.
+                 (when (eq (agents-workflow-agent-backend agent) 'omp)
+                   (agents-workflow--omp-capture-last-message-async agent))
+                 (when running
                   (agents-workflow--emit wf
                     `(:event worker-waiting
                       :agent ,(agents-workflow-agent-name agent)))))
@@ -1839,6 +1879,9 @@ stopped workflow).  Trigger emission stays gated on a running workflow."
 ;; OpenCode reuses the same generic buffer->agent status handler as codex
 ;; (it maps (BUFFER STATUS) to the owning agent; nothing codex-specific).
 (add-hook 'opencode-cli-status-change-functions #'agents-workflow--handle-codex-status)
+;; omp reuses the same generic buffer->agent status handler as codex
+;; (it maps (BUFFER STATUS) to the owning agent; nothing codex-specific).
+(add-hook 'omp-cli-status-change-functions #'agents-workflow--handle-codex-status)
 
 ;;;; Workflow lifecycle
 
@@ -2050,6 +2093,18 @@ session-id or none is found yet."
       (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
         (agents-workflow--persist-workflow (agents-workflow-name wf))))))
 
+(defun agents-workflow--omp-capture-session-id (agent dir)
+  "Resolve AGENT's omp session id from the sessions directory for DIR.
+Like the opencode variant, resolved lazily at teardown (before a restart
+or on quit) rather than on a launch timer.  No-op if AGENT already has a
+session-id or none is found yet."
+  (when (and (agents-workflow-agent-p agent)
+             (not (agents-workflow-agent-session-id agent)))
+    (when-let ((sid (omp-cli--latest-session-id-for-dir dir)))
+      (setf (agents-workflow-agent-session-id agent) sid)
+      (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+        (agents-workflow--persist-workflow (agents-workflow-name wf))))))
+
 ;;;; Last-output capture (the model's actual reply, at turn end)
 
 (defun agents-workflow--last-sentence (text)
@@ -2158,7 +2213,35 @@ the dashboard.  Async so the ~1-2s CLI spin-up never blocks Emacs."
                        (agents-workflow--set-last-output-sentence agent msg)
                        (ignore-errors (claude-dashboard-refresh-all)))))
                (when (buffer-live-p out) (kill-buffer out))
-               (when (buffer-live-p err) (kill-buffer err))))))))))
+                (when (buffer-live-p err) (kill-buffer err))))))))))
+
+(defun agents-workflow--omp-capture-last-message-async (agent)
+  "Fetch AGENT's last omp assistant message by reading the session JSONL
+file asynchronously, storing its last sentence as last-output and
+refreshing the dashboard.  Async so the file read never blocks Emacs."
+  (let ((dir (agents-workflow-agent-directory agent)))
+    (unless (agents-workflow-agent-session-id agent)
+      (agents-workflow--omp-capture-session-id agent dir))
+    (when-let* ((sid (agents-workflow-agent-session-id agent))
+                ((and dir (file-directory-p dir)))
+                (file (omp-cli--session-file-for-id dir sid)))
+      (let ((out (generate-new-buffer " *aw-omp-export*"))
+            (default-directory (file-name-as-directory (expand-file-name dir))))
+        (make-process
+         :name "aw-omp-export"
+         :buffer out
+         :noquery t
+         :command (list "cat" file)
+         :sentinel
+         (lambda (proc _event)
+           (when (memq (process-status proc) '(exit signal))
+             (unwind-protect
+                 (when (eq 0 (process-exit-status proc))
+                   (let ((jsonl (with-current-buffer out (buffer-string))))
+                     (when-let ((msg (omp-cli--export-last-assistant-text jsonl)))
+                       (agents-workflow--set-last-output-sentence agent msg)
+                       (ignore-errors (claude-dashboard-refresh-all)))))
+                (when (buffer-live-p out) (kill-buffer out))))))))))
 
 (defun agents-workflow--capture-last-message (agent)
   "Store AGENT's latest model reply (last sentence) as its last-output.
@@ -2174,7 +2257,9 @@ hook)."
                       (agents-workflow-agent-directory agent))))
        (agents-workflow--set-last-output-sentence agent msg)))
     ('opencode
-     (agents-workflow--opencode-capture-last-message-async agent))))
+     (agents-workflow--opencode-capture-last-message-async agent))
+    ('omp
+     (agents-workflow--omp-capture-last-message-async agent))))
 
 ;;;; Turn-end PUSH receivers (codex `notify' / opencode plugin -> emacsclient)
 ;;
@@ -2284,6 +2369,60 @@ session-id, stores the reply's last sentence as last-output, marks it idle."
       (agents-workflow--mark-agent-idle-and-refresh agent)))
   nil)
 
+(defun agents-workflow-handle-omp-status (status dir &optional agent-name wf-name)
+  "Receive an omp status push (STATUS is \"working\" or \"idle\") for cwd DIR.
+Routes to the agent by (WF-NAME, AGENT-NAME) then by DIR, same as the
+reply handler.  Sets the agent's status and refreshes the dashboard —
+this is the deterministic signal from omp's --hook extension events
+(before_provider_request → working, session.idle → idle), bypassing
+screen-scraping entirely.  On the working→idle transition, also fires
+the async last-message capture as a fallback in case the reply push
+didn't arrive."
+  (when-let ((agent (or (agents-workflow--find-agent-globally wf-name agent-name)
+                        (agents-workflow--find-agent-by-dir dir 'omp))))
+    (let ((sym (if (equal status "working") 'running 'waiting)))
+      (when (and (eq sym 'waiting)
+                 (eq (agents-workflow-agent-status agent) 'running))
+        ;; working→idle transition: capture last output as fallback
+        (agents-workflow--omp-capture-last-message-async agent))
+      (unless (eq (agents-workflow-agent-status agent) sym)
+        (setf (agents-workflow-agent-status agent) sym)
+        (setf (agents-workflow-agent-last-activity agent) (float-time))
+        (when-let ((buf (agents-workflow-agent-buffer agent)))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (setq omp-cli--status (if (eq sym 'running) 'working 'idle)))))
+        (ignore-errors (claude-dashboard-refresh-all)))))
+  nil)
+
+(defun agents-workflow-handle-omp-reply (session-id dir &optional agent-name wf-name)
+  "Receive an omp turn-end push for SESSION-ID in cwd DIR.
+The assistant reply text is passed as a trailing emacsclient arg and popped
+from `server-eval-args-left'.  Routes to the agent by (WF-NAME, AGENT-NAME)
+when the hook supplies them — unambiguous with several omp agents in one
+worktree — then by SESSION-ID, then by DIR.  Tracks the agent's current
+session-id, stores the reply's last sentence as last-output, marks it idle."
+  (let ((text (when server-eval-args-left (pop server-eval-args-left))))
+    (setq server-eval-args-left nil)
+    (when-let ((agent (or (agents-workflow--find-agent-globally wf-name agent-name)
+                          (agents-workflow--find-agent-by-session-id session-id)
+                          (agents-workflow--find-agent-by-dir dir 'omp))))
+      ;; Always track the CURRENT live session id (not just backfill when
+      ;; nil).  omp can move an agent onto a new session; if we only set
+      ;; it once, the stored id goes stale and quit/restart resumes the
+      ;; wrong (old) session, orphaning the current one.  Persist on change
+      ;; so the resume survives a full quit/restart.
+      (when (and (stringp session-id) (not (string-empty-p session-id))
+                 (not (equal (agents-workflow-agent-session-id agent) session-id)))
+        (setf (agents-workflow-agent-session-id agent) session-id)
+        (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+          (ignore-errors
+            (agents-workflow--persist-workflow (agents-workflow-name wf)))))
+      (when (and (stringp text) (not (string-empty-p (string-trim text))))
+        (agents-workflow--set-last-output-sentence agent text))
+      (agents-workflow--mark-agent-idle-and-refresh agent)))
+  nil)
+
 (defun agents-workflow--start-codex-interactive (agent)
   "Start interactive AGENT by creating a Codex eat terminal.
 If AGENT has a session-id, resume that Codex session via the `resume'
@@ -2334,8 +2473,8 @@ is fully written and the newest one for this cwd is unambiguously ours."
   "Map of AGENT struct -> source session id awaiting a one-shot fork launch.
 `agents-workflow--panel-fork-agent' populates this for OpenCode agents;
 `agents-workflow--start-opencode-interactive' consumes it exactly once,
-launching `opencode --session <src> --fork' so OpenCode mints a fresh
-forked session (whose own id is captured lazily at teardown).")
+  launching `opencode --session <src> --fork' so OpenCode mints a fresh
+  forked session (whose own id is captured lazily at teardown).")
 
 (defun agents-workflow--start-opencode-interactive (agent)
   "Start interactive AGENT by creating an OpenCode eat terminal.
@@ -2386,6 +2525,73 @@ Launch semantics, in order:
                            (lambda ()
                              (when (buffer-live-p buffer)
                                (opencode-cli--send-command system-prompt buffer)))))))))))
+
+(defvar agents-workflow--omp-fork-pending (make-hash-table :test 'eq)
+  "Map of AGENT struct -> source session id awaiting a one-shot fork launch.
+`agents-workflow--panel-fork-agent' populates this for omp agents;
+`agents-workflow--start-omp-interactive' consumes it exactly once,
+launching `omp --resume <src>' so omp opens the source session (the
+original is preserved since omp writes new turns to a new session file).")
+
+(defun agents-workflow--start-omp-interactive (agent)
+  "Start interactive AGENT by creating an omp eat terminal.
+Launch semantics, in order:
+- Fork-pending (set by `agents-workflow--panel-fork-agent'): launch
+  `omp --resume <src-id>' once, then clear the marker.
+- Has session-id: resume it via `--resume <id>'.
+- Otherwise: launch fresh (omp mints its own session id, resolved
+  lazily at teardown, mirroring codex/opencode)."
+  (let* ((dir (agents-workflow-agent-directory agent))
+         (instance-name (agents-workflow-agent-name agent))
+         (existing (omp-cli--find-buffers-for-directory dir))
+         (matching (cl-find-if
+                    (lambda (buf)
+                      (equal (omp-cli--extract-instance-name
+                              (buffer-name buf))
+                             instance-name))
+                    existing)))
+    (if matching
+        (setf (agents-workflow-agent-buffer agent) matching)
+      (let* ((fork-src (gethash agent agents-workflow--omp-fork-pending))
+             (session-id (agents-workflow-agent-session-id agent))
+             (launch-switches
+              (cond
+               (fork-src (list "--resume" fork-src))
+               (session-id (list "--resume" session-id))
+               (t nil)))
+             (wf (agents-workflow--find-workflow-for-agent agent))
+             ;; Thread agent identity into the env so the omp hook
+             ;; (running inside this omp process) can route the
+             ;; turn-end push back to THIS agent even when several share
+             ;; a worktree (the Claude CLAUDE_BUFFER_NAME pattern).
+             (process-environment
+              (append (list (format "AGENTS_WORKFLOW_AGENT=%s" instance-name)
+                            (format "AGENTS_WORKFLOW_NAME=%s"
+                                    (if wf (agents-workflow-name wf) "")))
+                      process-environment))
+              ;; Load the agents-workflow hook so turn-end replies are
+              ;; pushed to Emacs (mirrors the opencode plugin).
+              (hook-path (expand-file-name
+                           "omp-plugin/agents-workflow-omp-hook.ts"
+                           (file-name-directory
+                            (locate-library "agents-workflow"))))
+              (launch-switches
+               (if (and hook-path (file-exists-p hook-path))
+                   (append launch-switches (list "--hook" hook-path))
+                 launch-switches))
+             (buffer (omp-cli--start dir instance-name launch-switches)))
+        (when fork-src
+          (remhash agent agents-workflow--omp-fork-pending))
+        (when buffer
+          (setf (agents-workflow-agent-buffer agent) buffer)
+          (let ((system-prompt (or (agents-workflow-agent-system-prompt agent)
+                                   (agents-workflow--convention-system-prompt
+                                    instance-name))))
+            (when system-prompt
+              (run-at-time 3 nil
+                           (lambda ()
+                             (when (buffer-live-p buffer)
+                                (omp-cli--send-command system-prompt buffer)))))))))))
 
 (defun agents-workflow--resolve-context-file (workflow)
   "Return the absolute path to WORKFLOW's context file, or nil."
@@ -2497,8 +2703,9 @@ If WORKFLOW is provided, send its context file to the agent on startup."
      (pcase (agents-workflow-agent-backend agent)
        ('claude (agents-workflow--start-claude-interactive agent))
        ('codex  (agents-workflow--start-codex-interactive agent))
-       ('opencode (agents-workflow--start-opencode-interactive agent))
-       (_ (error "Unknown backend: %s" (agents-workflow-agent-backend agent))))
+        ('opencode (agents-workflow--start-opencode-interactive agent))
+        ('omp (agents-workflow--start-omp-interactive agent))
+        (_ (error "Unknown backend: %s" (agents-workflow-agent-backend agent))))
      (agents-workflow--install-title-watcher agent)
      ;; Offer to send shared context file unless agent has its own system prompt
      (when (and workflow
@@ -2793,7 +3000,9 @@ including dynamically-added ones."
                                         ('codex (agents-workflow--codex-latest-session-id
                                                  (agents-workflow-agent-directory agent)))
                                         ('opencode (opencode-cli--latest-session-id-for-dir
-                                                    (agents-workflow-agent-directory agent)))))))
+                                                    (agents-workflow-agent-directory agent)))
+                                        ('omp (omp-cli--latest-session-id-for-dir
+                                              (agents-workflow-agent-directory agent)))))))
                          (when sid
                            (setf (agents-workflow-agent-session-id agent) sid)
                            (setq entry (plist-put entry :session-id sid))))
