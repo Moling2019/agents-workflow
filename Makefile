@@ -8,7 +8,7 @@ LOAD_PATH := -L . -L test \
 	$(patsubst %,-L %,$(wildcard $(ELPA_DIR)/nerd-icons-*))
 
 PACKAGES := agents-workflow.el claude-dashboard.el codex-cli.el \
-	databricks-runs.el jira-board.el slack-monitor.el github-prs.el
+	omp-cli.el databricks-runs.el jira-board.el slack-monitor.el github-prs.el
 
 TEST_FILES := $(wildcard test/*-tests.el)
 
