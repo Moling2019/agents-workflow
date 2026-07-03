@@ -1503,9 +1503,14 @@ session file from Claude's project storage."
   ;; Kill linked buffer (interactive agents)
   (when-let ((buf (agents-workflow-agent-buffer agent)))
     (when (buffer-live-p buf)
-      ;; Disable process-query so kill-buffer doesn't prompt again
+      ;; Explicitly kill the process before the buffer — some CLI
+      ;; tools (omp) catch SIGHUP from kill-buffer and survive as
+      ;; orphans, continuing to respawn MCP servers etc.
       (when-let ((proc (get-buffer-process buf)))
-        (set-process-query-on-exit-flag proc nil))
+        (set-process-query-on-exit-flag proc nil)
+        (when (process-live-p proc)
+          (kill-process proc))))
+    (when (buffer-live-p buf)
       (kill-buffer buf)))
   (setf (agents-workflow-agent-status agent) 'idle)
   (setf (agents-workflow-agent-process agent) nil)
