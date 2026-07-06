@@ -2098,17 +2098,67 @@ session-id or none is found yet."
       (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
         (agents-workflow--persist-workflow (agents-workflow-name wf))))))
 
+(defun agents-workflow--omp-sibling-session-ids (agent)
+  "Return the session-ids already claimed by AGENT's sibling omp agents.
+Used so two omp agents sharing one worktree never bind to the same
+session id (the collapse that `omp-cli--latest-session-id-for-dir'
+caused when several agents lived in one directory)."
+  (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+    (delq nil (mapcar (lambda (a)
+                        (unless (eq a agent)
+                          (agents-workflow-agent-session-id a)))
+                      (agents-workflow-agents wf)))))
+
 (defun agents-workflow--omp-capture-session-id (agent dir)
   "Resolve AGENT's omp session id from the sessions directory for DIR.
-Like the opencode variant, resolved lazily at teardown (before a restart
-or on quit) rather than on a launch timer.  No-op if AGENT already has a
-session-id or none is found yet."
+Teardown fallback (on quit / just before a restart) for the rare case
+where the launch-time capture never bound an id.  Picks the newest
+session for DIR that is NOT already claimed by a sibling agent, so
+several omp agents sharing a worktree don't all collapse onto the single
+newest file.  No-op if AGENT already has a session-id or none is free."
   (when (and (agents-workflow-agent-p agent)
              (not (agents-workflow-agent-session-id agent)))
-    (when-let ((sid (omp-cli--latest-session-id-for-dir dir)))
-      (setf (agents-workflow-agent-session-id agent) sid)
-      (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
-        (agents-workflow--persist-workflow (agents-workflow-name wf))))))
+    (let* ((siblings (agents-workflow--omp-sibling-session-ids agent))
+           (sid (cl-loop for s in (omp-cli--session-list dir)
+                         for id = (alist-get 'id s)
+                         unless (member id siblings) return id)))
+      (when sid
+        (setf (agents-workflow-agent-session-id agent) sid)
+        (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+          (agents-workflow--persist-workflow (agents-workflow-name wf)))))))
+
+(defun agents-workflow--omp-schedule-session-capture (agent dir known-ids
+                                                            &optional attempt)
+  "Bind a freshly-launched omp AGENT to the NEW session that appears in DIR.
+KNOWN-IDS is the set of session ids present just before launch.  omp mints
+its own id at startup (no preset-id flag), so we poll a few times and claim
+the oldest session id that is neither pre-existing nor already held by a
+sibling agent, then persist.  This replaces the ambiguous \"newest session
+in dir\" capture, which collapsed multiple omp agents sharing one worktree
+onto a single id.  Gives up quietly after ~15s (the teardown fallback and
+the turn-end hook remain as backstops)."
+  (let ((attempt (or attempt 0)))
+    (when (and (agents-workflow-agent-p agent)
+               (not (agents-workflow-agent-session-id agent))
+               (< attempt 10))
+      (let* ((siblings (agents-workflow--omp-sibling-session-ids agent))
+             (candidates
+              (cl-remove-if (lambda (s)
+                              (let ((id (alist-get 'id s)))
+                                (or (member id known-ids)
+                                    (member id siblings))))
+                            (omp-cli--session-list dir))))
+        (if candidates
+            ;; Oldest unclaimed new session = the earliest-launched still
+            ;; unbound agent's own session (session-list is newest-first).
+            (let ((sid (alist-get 'id (car (last candidates)))))
+              (setf (agents-workflow-agent-session-id agent) sid)
+              (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+                (ignore-errors
+                  (agents-workflow--persist-workflow (agents-workflow-name wf)))))
+          (run-at-time 1.5 nil
+                       #'agents-workflow--omp-schedule-session-capture
+                       agent dir known-ids (1+ attempt)))))))
 
 ;;;; Last-output capture (the model's actual reply, at turn end)
 
@@ -2559,6 +2609,13 @@ Launch semantics, in order:
         (setf (agents-workflow-agent-buffer agent) matching)
       (let* ((fork-src (gethash agent agents-workflow--omp-fork-pending))
              (session-id (agents-workflow-agent-session-id agent))
+             ;; A fresh launch mints a new omp session; snapshot the dir's
+             ;; existing session ids so we can claim the one that appears
+             ;; (per-agent), instead of the ambiguous "newest in dir".
+             (fresh-launch (and (not fork-src) (not session-id)))
+             (pre-ids (when fresh-launch
+                        (mapcar (lambda (s) (alist-get 'id s))
+                                (omp-cli--session-list dir))))
              (launch-switches
               (cond
                (fork-src (list "--resume" fork-src))
@@ -2589,6 +2646,11 @@ Launch semantics, in order:
           (remhash agent agents-workflow--omp-fork-pending))
         (when buffer
           (setf (agents-workflow-agent-buffer agent) buffer)
+          ;; Claim this agent's own newly-minted session id at launch.
+          (when fresh-launch
+            (run-at-time 2 nil
+                         #'agents-workflow--omp-schedule-session-capture
+                         agent dir pre-ids 0))
           (let ((system-prompt (or (agents-workflow-agent-system-prompt agent)
                                    (agents-workflow--convention-system-prompt
                                     instance-name))))
