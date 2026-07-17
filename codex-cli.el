@@ -144,6 +144,11 @@ Buffer name format is *codex:DIR:INSTANCE*."
   "Launch a Codex eat terminal in DIR with optional INSTANCE name.
 EXTRA-SWITCHES are appended to `codex-cli-program-switches'.
 Returns the buffer, or nil if creation failed."
+  ;; Ensure the shared eat-terminal backend generics (claude-code--term-*)
+  ;; are loaded — a codex agent may be launched before any claude agent has
+  ;; pulled in claude-code.  Runtime require (not top-level) so the byte
+  ;; compiler doesn't drag claude-code's own deps into the build.
+  (require 'claude-code)
   (let* ((default-directory dir)
          (buffer-name (codex-cli--buffer-name dir instance))
          (switches (append codex-cli-program-switches extra-switches))

@@ -241,6 +241,11 @@ The export shape is {messages: [{info: {role}, parts: [{type,text}]}]}."
   "Launch an OpenCode eat terminal in DIR with optional INSTANCE name.
 EXTRA-SWITCHES are appended to `opencode-cli-program-switches'.
 Returns the buffer, or nil if creation failed."
+  ;; Ensure the shared eat-terminal backend generics (claude-code--term-*)
+  ;; are loaded — an opencode agent may be launched before any claude agent
+  ;; has pulled in claude-code.  Runtime require (not top-level) so the byte
+  ;; compiler doesn't drag claude-code's own deps into the build.
+  (require 'claude-code)
   (let* ((default-directory dir)
          (buffer-name (opencode-cli--buffer-name dir instance))
          (switches (append opencode-cli-program-switches extra-switches))
