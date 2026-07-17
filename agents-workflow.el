@@ -2585,17 +2585,21 @@ Launch semantics, in order:
   "Map of AGENT struct -> source session id awaiting a one-shot fork launch.
 `agents-workflow--panel-fork-agent' populates this for omp agents;
 `agents-workflow--start-omp-interactive' consumes it exactly once,
-launching `omp --resume <src>' so omp opens the source session (the
-original is preserved since omp writes new turns to a new session file).")
+launching `omp --fork <src>' so omp mints a NEW session branched from the
+source (fresh id + parentSession lineage); the source is left untouched.
+Resume, by contrast, keeps the same id and appends — using it here (the
+original bug) made the fork silently SHARE the source's session.")
 
 (defun agents-workflow--start-omp-interactive (agent)
   "Start interactive AGENT by creating an omp eat terminal.
 Launch semantics, in order:
 - Fork-pending (set by `agents-workflow--panel-fork-agent'): launch
-  `omp --resume <src-id>' once, then clear the marker.
+  `omp --fork <src-id>' once (minting a NEW branched session), then
+  clear the marker.
 - Has session-id: resume it via `--resume <id>'.
-- Otherwise: launch fresh (omp mints its own session id, resolved
-  lazily at teardown, mirroring codex/opencode)."
+- Otherwise: launch fresh.
+Both fork and fresh mint a new session id, claimed at launch by
+`agents-workflow--omp-schedule-session-capture'; resume keeps its id."
   (let* ((dir (agents-workflow-agent-directory agent))
          (instance-name (agents-workflow-agent-name agent))
          (existing (omp-cli--find-buffers-for-directory dir))
@@ -2609,16 +2613,20 @@ Launch semantics, in order:
         (setf (agents-workflow-agent-buffer agent) matching)
       (let* ((fork-src (gethash agent agents-workflow--omp-fork-pending))
              (session-id (agents-workflow-agent-session-id agent))
-             ;; A fresh launch mints a new omp session; snapshot the dir's
-             ;; existing session ids so we can claim the one that appears
-             ;; (per-agent), instead of the ambiguous "newest in dir".
-             (fresh-launch (and (not fork-src) (not session-id)))
-             (pre-ids (when fresh-launch
+             ;; A fresh launch AND a fork both mint a NEW omp session id
+             ;; (resume keeps the existing one).  Snapshot the dir's existing
+             ;; session ids so we can claim the new one per-agent, instead of
+             ;; the ambiguous "newest in dir".
+             (mint-new (or fork-src (not session-id)))
+             (pre-ids (when mint-new
                         (mapcar (lambda (s) (alist-get 'id s))
                                 (omp-cli--session-list dir))))
              (launch-switches
               (cond
-               (fork-src (list "--resume" fork-src))
+               ;; `--fork' branches a NEW session from the source (fresh id +
+               ;; parentSession lineage).  `--resume' would instead SHARE the
+               ;; source's session and append to it — that is not a fork.
+               (fork-src (list "--fork" fork-src))
                (session-id (list "--resume" session-id))
                (t nil)))
              (wf (agents-workflow--find-workflow-for-agent agent))
@@ -2646,8 +2654,13 @@ Launch semantics, in order:
           (remhash agent agents-workflow--omp-fork-pending))
         (when buffer
           (setf (agents-workflow-agent-buffer agent) buffer)
-          ;; Claim this agent's own newly-minted session id at launch.
-          (when fresh-launch
+          ;; Claim this agent's own newly-minted session id at launch (fresh
+          ;; or fork).  On a fork the agent may still hold the SOURCE's id;
+          ;; clear it so capture binds the new branched session, not the
+          ;; source (which it also excludes as a sibling id).
+          (when mint-new
+            (when fork-src
+              (setf (agents-workflow-agent-session-id agent) nil))
             (run-at-time 2 nil
                          #'agents-workflow--omp-schedule-session-capture
                          agent dir pre-ids 0))
