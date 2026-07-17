@@ -340,6 +340,13 @@ Returns the buffer, or nil if creation failed."
 (defun omp-cli--setup-buffer-appearance ()
   "Configure the current buffer to look like a polished omp terminal."
   (setq-local vertical-scroll-bar nil)
+  ;; A high global `scroll-conservatively' (e.g. 100000) makes Emacs crawl
+  ;; line-by-line to bring point into view — so switching to a long omp
+  ;; buffer scrolls visibly from top to bottom.  Force recenter/jump here
+  ;; (buffer-local; the global preference is left untouched).  eat still
+  ;; positions the cursor during live output via its own `recenter'.
+  (setq-local scroll-conservatively 0)
+  (setq-local scroll-margin 0)
   (when-let ((win (get-buffer-window (current-buffer))))
     (set-window-fringes win 0 0))
   (setq-local blink-cursor-mode nil)
