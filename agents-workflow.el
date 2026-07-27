@@ -537,12 +537,23 @@ Each label is prefixed with a tree character."
         (push (concat prefix name) labels)))
     (nreverse labels)))
 
-(defun agents-workflow--dashboard-entries (workflow)
+(defun agents-workflow--agent-personal-p (agent)
+  "Non-nil if AGENT belongs in the dashboard's Personal section.
+True when its metadata marks a personal account: an explicit `:section'
+of personal, or a `:config-home' (it runs under a non-default account
+home such as ~/.claude-personal).  Everything else is Work."
+  (let ((md (agents-workflow-agent-metadata agent)))
+    (or (eq (plist-get md :section) 'personal)
+        (equal (plist-get md :section) "personal")
+        (and (plist-get md :config-home) t))))
+
+(defun agents-workflow--dashboard-entries (workflow &optional filter)
   "Generate dashboard entries from WORKFLOW agents.
 Returns a list of (ID [col-values ...]) for the agents panel :entries function.
 For agents with a live buffer, extracts fresh output on each refresh
 cycle rather than relying solely on the title-watcher event.
-When an agent is expanded, extra directory sub-rows are appended."
+When an agent is expanded, extra directory sub-rows are appended.
+When FILTER is non-nil, only agents satisfying it are included."
   (mapcan
    (lambda (agent)
      ;; Try to reconnect stale/nil buffer references on each refresh
@@ -584,7 +595,9 @@ When an agent is expanded, extra directory sub-rows are appended."
              (cons main-row sub-rows))
          ;; Collapsed: just main row
          (list main-row))))
-   (agents-workflow-agents workflow)))
+   (if filter
+       (cl-remove-if-not filter (agents-workflow-agents workflow))
+     (agents-workflow-agents workflow))))
 
 ;;;; Dashboard panel (for claude-dashboard.el compositor)
 
@@ -599,19 +612,30 @@ When an agent is expanded, extra directory sub-rows are appended."
       (puthash agent-name t agents-workflow--expanded-agents))
     (claude-dashboard-refresh-all)))
 
-(defun agents-workflow-agents-panel (workflow)
+(defun agents-workflow-agents-panel (workflow &optional section)
   "Return a dashboard panel plist for WORKFLOW's agents.
-For use with `claude-dashboard-create'."
-  (let ((wf-name (agents-workflow-name workflow)))
+For use with `claude-dashboard-create'.
+SECTION nil shows all agents in one \"Agents\" panel; `work' or `personal'
+restricts to that group and titles the panel accordingly, so the dashboard
+can render Work and Personal as two separate sections."
+  (let* ((wf-name (agents-workflow-name workflow))
+         (filter (pcase section
+                   ('personal #'agents-workflow--agent-personal-p)
+                   ('work (lambda (a) (not (agents-workflow--agent-personal-p a))))
+                   (_ nil)))
+         (name (pcase section
+                 ('personal "agents-personal") ('work "agents-work") (_ "agents")))
+         (title (pcase section
+                  ('personal "Personal") ('work "Work") (_ "Agents"))))
     (list
-     :name "agents"
-     :title "Agents"
+     :name name
+     :title title
      :columns [("Agent" 16 t) ("T" 3 t) ("S" 3 nil)
                ("Dir" 18 nil) ("Activity" 10 nil) ("Last Output" 0 nil)]
      :entries (lambda ()
                 (when-let ((wf (agents-workflow--get wf-name)))
                   (mapcar (lambda (e) (cons (car e) (cadr e)))
-                          (agents-workflow--dashboard-entries wf))))
+                          (agents-workflow--dashboard-entries wf filter))))
      :actions `(("RET" . ,(lambda (_panel row-id)
                             (agents-workflow--panel-visit-agent wf-name row-id)))
                 ("s" . ,(lambda (_panel row-id)
@@ -1083,13 +1107,25 @@ the user chose to use the base directory directly."
         (user-error "Agent %s already exists" name))
       (let* ((backend-str (completing-read "Backend: " '("claude" "codex" "opencode" "omp") nil t nil nil "claude"))
              (backend (intern backend-str))
+             (account (completing-read "Account: " '("work" "personal") nil t nil nil "work"))
+             (personal (equal account "personal"))
+             ;; Personal claude/codex run under an isolated config home (real
+             ;; account separation); opencode/omp auth via the shared gateway,
+             ;; so `personal' there only files them under the Personal section.
+             (metadata (when personal
+                         (pcase backend
+                           ('claude (list :config-home "~/.claude-personal"))
+                           ('codex  (list :config-home "~/.codex-personal"))
+                           (_ (list :section 'personal)))))
              (wf-dir (agents-workflow-directory wf))
              (base-dir (let ((dir-choice (completing-read
                                           "Directory: "
                                           (list (abbreviate-file-name wf-dir) "Other directory...")
                                           nil t nil nil (abbreviate-file-name wf-dir))))
                           (if (equal dir-choice "Other directory...")
-                              (read-directory-name "Agent directory: " "~/Documents/work/")
+                              (read-directory-name "Agent directory: "
+                                                   (if personal "~/Documents/personal/"
+                                                     "~/Documents/work/"))
                             (expand-file-name dir-choice))))
              (result (agents-workflow--prompt-worktree base-dir name))
              (agent-dir (car result))
@@ -1098,14 +1134,15 @@ the user chose to use the base directory directly."
                       :name name :type 'interactive :status 'idle
                       :backend backend
                       :directory agent-dir
-                      :worktree-path wt-path)))
+                      :worktree-path wt-path
+                      :metadata metadata)))
           (setf (agents-workflow-agents wf)
                 (append (agents-workflow-agents wf) (list agent)))
           (agents-workflow--start-agent agent wf)
           (agents-workflow--persist-workflow wf-name)
           (claude-dashboard-refresh-all)
-          (message "Added and started %s agent %s%s"
-                   backend-str name
+          (message "Added and started %s %s agent %s%s"
+                   account backend-str name
                    (if wt-path (format " (worktree: %s)" (file-name-nondirectory (directory-file-name wt-path))) "")))))))
 
 (defun agents-workflow--encode-project-path (path)
@@ -1427,7 +1464,13 @@ If WORKFLOW-NAME is nil, prompt from registered workflows."
                                    nil t)))
          (wf (agents-workflow--get name)))
     (unless wf (error "No workflow named %s" name))
-    (let ((panels (list (agents-workflow-agents-panel wf))))
+    (let* ((has-personal (cl-some #'agents-workflow--agent-personal-p
+                                  (agents-workflow-agents wf)))
+           (panels (if has-personal
+                       ;; Split into Work + Personal sections
+                       (list (agents-workflow-agents-panel wf 'work)
+                             (agents-workflow-agents-panel wf 'personal))
+                     (list (agents-workflow-agents-panel wf)))))
       ;; Add optional panels listed in the workflow definition
       (dolist (panel-name (agents-workflow-panels wf))
         (when-let ((entry (alist-get panel-name agents-workflow-panel-registry
@@ -1970,6 +2013,22 @@ indicates the CLI is idle/waiting (defaults to the global pattern)."
                    (list "--add-dir" (plist-get ed :directory)))
                  (agents-workflow-agent-extra-directories agent))))
 
+(defun agents-workflow--agent-account-env (agent)
+  "Return extra `process-environment' entries to run AGENT under a chosen account.
+Read from the agent's metadata `:config-home' (e.g. \"~/.claude-personal\"),
+this isolates auth, config, and session history to that home directory so a
+personal account can run in the dashboard alongside the default (work) one.
+Maps to CLAUDE_CONFIG_DIR for the `claude' backend and CODEX_HOME for `codex'
+\(opencode/omp authenticate via the shared gateway, so they are unaffected).
+Returns nil when `:config-home' is unset."
+  (when-let* ((md (agents-workflow-agent-metadata agent))
+              (home (plist-get md :config-home)))
+    (let ((path (expand-file-name home)))
+      (pcase (agents-workflow-agent-backend agent)
+        ('claude (list (format "CLAUDE_CONFIG_DIR=%s" path)))
+        ('codex  (list (format "CODEX_HOME=%s" path)))
+        (_ nil)))))
+
 (defun agents-workflow--start-claude-interactive (agent)
   "Start interactive AGENT by creating a claude-code.el eat terminal.
 Uses the agent name as the instance name, bypassing the interactive prompt.
@@ -2018,7 +2077,8 @@ If the agent has a session-id, resumes that session with --resume."
                                (funcall func buffer-name dir))
                              claude-code-process-environment-functions)))
              (process-environment
-              (append `(,(format "CLAUDE_BUFFER_NAME=%s" buffer-name)
+              (append (agents-workflow--agent-account-env agent)
+                      `(,(format "CLAUDE_BUFFER_NAME=%s" buffer-name)
                         ,(format "CLAUDE_WORKFLOW=%s"
                                  (if wf (agents-workflow-name wf) ""))
                         ,(format "CLAUDE_AGENT=%s" instance-name))
@@ -2508,7 +2568,8 @@ is fully written and the newest one for this cwd is unambiguously ours."
              ;; turn-end push back to THIS agent even when several share a
              ;; worktree (the Claude CLAUDE_BUFFER_NAME pattern).
              (process-environment
-              (append (list (format "AGENTS_WORKFLOW_AGENT=%s" instance-name)
+              (append (agents-workflow--agent-account-env agent)
+                      (list (format "AGENTS_WORKFLOW_AGENT=%s" instance-name)
                             (format "AGENTS_WORKFLOW_NAME=%s"
                                     (if wf (agents-workflow-name wf) "")))
                       process-environment))
