@@ -2029,21 +2029,40 @@ indicates the CLI is idle/waiting (defaults to the global pattern)."
                    (list "--add-dir" (plist-get ed :directory)))
                  (agents-workflow-agent-extra-directories agent))))
 
+(defcustom agents-workflow-personal-gws-config-dir "~/.config/gws-personal"
+  "Google Workspace CLI (`gws') config dir for personal agents.
+When non-nil, personal agents (see `agents-workflow--agent-personal-p')
+launch with GOOGLE_WORKSPACE_CLI_CONFIG_DIR pointed here, so their `gws'
+calls (Gmail, Calendar, Drive, …) use the personal Google account rather
+than the work one.  Set to nil to leave `gws' on its default."
+  :type '(choice (const :tag "Disable" nil) directory)
+  :group 'agents-workflow)
+
 (defun agents-workflow--agent-account-env (agent)
   "Return extra `process-environment' entries to run AGENT under a chosen account.
-Read from the agent's metadata `:config-home' (e.g. \"~/.claude-personal\"),
-this isolates auth, config, and session history to that home directory so a
-personal account can run in the dashboard alongside the default (work) one.
-Maps to CLAUDE_CONFIG_DIR for the `claude' backend and CODEX_HOME for `codex'
-\(opencode/omp authenticate via the shared gateway, so they are unaffected).
-Returns nil when `:config-home' is unset."
-  (when-let* ((md (agents-workflow-agent-metadata agent))
-              (home (plist-get md :config-home)))
-    (let ((path (expand-file-name home)))
-      (pcase (agents-workflow-agent-backend agent)
-        ('claude (list (format "CLAUDE_CONFIG_DIR=%s" path)))
-        ('codex  (list (format "CODEX_HOME=%s" path)))
-        (_ nil)))))
+For claude/codex agents whose metadata sets `:config-home' (e.g.
+\"~/.claude-personal\"), isolate auth/config/session history to that home via
+CLAUDE_CONFIG_DIR / CODEX_HOME so a personal account runs alongside the
+default (work) one (opencode/omp auth via the shared gateway, so no home is
+set).  For ANY personal agent (`agents-workflow--agent-personal-p'), also
+point the `gws' CLI at `agents-workflow-personal-gws-config-dir' via
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR, so Gmail/Calendar/Drive use the personal
+Google account.  Returns nil when neither applies."
+  (let ((env nil)
+        (md (agents-workflow-agent-metadata agent)))
+    ;; Backend-specific account home (claude/codex only).
+    (when-let ((home (plist-get md :config-home)))
+      (let ((path (expand-file-name home)))
+        (pcase (agents-workflow-agent-backend agent)
+          ('claude (push (format "CLAUDE_CONFIG_DIR=%s" path) env))
+          ('codex  (push (format "CODEX_HOME=%s" path) env)))))
+    ;; Personal Google account for gws (any personal agent, any backend).
+    (when (and (agents-workflow--agent-personal-p agent)
+               agents-workflow-personal-gws-config-dir)
+      (push (format "GOOGLE_WORKSPACE_CLI_CONFIG_DIR=%s"
+                    (expand-file-name agents-workflow-personal-gws-config-dir))
+            env))
+    env))
 
 (defun agents-workflow--start-claude-interactive (agent)
   "Start interactive AGENT by creating a claude-code.el eat terminal.
