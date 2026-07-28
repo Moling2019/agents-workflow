@@ -39,6 +39,8 @@
     (slack       :icon "chat"            :face (:foreground "#a6e3a1"))
     ;; Section headers
     (agents      :icon "group"           :face (:foreground "#89b4fa"))
+    (agents-work     :icon "work"        :face (:foreground "#89b4fa"))
+    (agents-personal :icon "person"      :face (:foreground "#cba6f7"))
     (databricks  :icon "storage"         :face (:foreground "#fab387"))
     (pulls       :icon "merge_type"      :face (:foreground "#cba6f7"))
     (channels    :icon "forum"           :face (:foreground "#a6e3a1"))
