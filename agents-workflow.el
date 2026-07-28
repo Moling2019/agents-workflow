@@ -674,13 +674,24 @@ can render Work and Personal as two separate sections."
 (defvar agents-workflow--side-current-wf nil
   "Workflow name currently displayed in the side dashboard.")
 
-(defun agents-workflow-agents-panel-compact (workflow)
+(defun agents-workflow-agents-panel-compact (workflow &optional section)
   "Slim agents panel for use in a narrow side window.
-Drops Type / Dir / Activity columns; keeps Name + Status + Last Output."
-  (let ((wf-name (agents-workflow-name workflow)))
+Drops Type / Dir / Activity columns; keeps Name + Status + Last Output.
+SECTION nil shows all agents; `work'/`personal' restrict and retitle, so the
+side panel can render Work and Personal as two sections like the main
+dashboard."
+  (let* ((wf-name (agents-workflow-name workflow))
+         (filter (pcase section
+                   ('personal #'agents-workflow--agent-personal-p)
+                   ('work (lambda (a) (not (agents-workflow--agent-personal-p a))))
+                   (_ nil)))
+         (name (pcase section
+                 ('personal "agents-personal") ('work "agents-work") (_ "agents")))
+         (title (pcase section
+                  ('personal "Personal") ('work "Work") (_ "Agents"))))
     (list
-     :name "agents"
-     :title "Agents"
+     :name name
+     :title title
      :columns [("Agent" 14 t) ("S" 3 nil) ("Last Output" 0 nil)]
      :entries (lambda ()
                 (when-let ((wf (agents-workflow--get wf-name)))
@@ -692,7 +703,7 @@ Drops Type / Dir / Activity columns; keeps Name + Status + Last Output."
                               (cons id (vector (aref full 0)
                                                (aref full 2)
                                                (aref full 5)))))
-                          (agents-workflow--dashboard-entries wf))))
+                          (agents-workflow--dashboard-entries wf filter))))
      ;; Full action set (mirrors `agents-workflow-agents-panel') so every
      ;; shortcut works from the side panel, and the compact mode-line lists
      ;; them all.
@@ -758,7 +769,12 @@ open a different workflow's main dashboard."
     (setq agents-workflow--side-current-wf name)
     ;; Create/refresh a single shared side buffer (not <wf>-specific so the
     ;; layout doesn't churn when switching workflows).
-    (let* ((panels (list (agents-workflow-agents-panel-compact wf))))
+    (let* ((has-personal (cl-some #'agents-workflow--agent-personal-p
+                                  (agents-workflow-agents wf)))
+           (panels (if has-personal
+                       (list (agents-workflow-agents-panel-compact wf 'work)
+                             (agents-workflow-agents-panel-compact wf 'personal))
+                     (list (agents-workflow-agents-panel-compact wf)))))
       ;; Mirror the main dashboard's optional-panel list.  Same auto-require
       ;; + registry-lookup pattern as `agents-workflow-dashboard'.
       (dolist (panel-name (agents-workflow-panels wf))
