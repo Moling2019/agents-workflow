@@ -1,0 +1,6 @@
+# Encrypt the personal Emacs config so it can live in this PUBLIC repo without
+# exposing internal tooling. Unlock with: git-crypt unlock <key-file>
+emacs/init.el                  filter=git-crypt diff=git-crypt
+emacs/early-init.el            filter=git-crypt diff=git-crypt
+emacs/package-versions.lock.el filter=git-crypt diff=git-crypt
+emacs/README.md                filter=git-crypt diff=git-crypt
