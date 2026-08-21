@@ -2038,27 +2038,44 @@ than the work one.  Set to nil to leave `gws' on its default."
   :type '(choice (const :tag "Disable" nil) directory)
   :group 'agents-workflow)
 
+(defcustom agents-workflow-personal-omp-profile "personal"
+  "omp profile name for personal omp agents.
+When non-nil, personal omp agents (see `agents-workflow--agent-personal-p')
+launch with OMP_PROFILE set to this, so omp uses an isolated profile under
+`~/.omp/profiles/<name>/' — its own auth, config, models, MCP servers, and
+sessions — separate from the default (work) `~/.omp/agent/'.  Set to nil to
+leave omp on the default profile."
+  :type '(choice (const :tag "Disable" nil) string)
+  :group 'agents-workflow)
+
 (defun agents-workflow--agent-account-env (agent)
   "Return extra `process-environment' entries to run AGENT under a chosen account.
 For claude/codex agents whose metadata sets `:config-home' (e.g.
 \"~/.claude-personal\"), isolate auth/config/session history to that home via
 CLAUDE_CONFIG_DIR / CODEX_HOME so a personal account runs alongside the
-default (work) one (opencode/omp auth via the shared gateway, so no home is
-set).  For ANY personal agent (`agents-workflow--agent-personal-p'), also
-point the `gws' CLI at `agents-workflow-personal-gws-config-dir' via
-GOOGLE_WORKSPACE_CLI_CONFIG_DIR, so Gmail/Calendar/Drive use the personal
-Google account.  Returns nil when neither applies."
+default (work) one.  Personal omp agents instead get OMP_PROFILE (=
+`agents-workflow-personal-omp-profile'), isolating auth/config/models/MCP/
+sessions under `~/.omp/profiles/<name>/'; opencode auths via the shared
+gateway and is unaffected.  For ANY personal agent
+\(`agents-workflow--agent-personal-p'), also point the `gws' CLI at
+`agents-workflow-personal-gws-config-dir' via GOOGLE_WORKSPACE_CLI_CONFIG_DIR,
+so Gmail/Calendar/Drive use the personal Google account.  Returns nil when
+none applies."
   (let ((env nil)
-        (md (agents-workflow-agent-metadata agent)))
-    ;; Backend-specific account home (claude/codex only).
+        (md (agents-workflow-agent-metadata agent))
+        (backend (agents-workflow-agent-backend agent))
+        (personal (agents-workflow--agent-personal-p agent)))
+    ;; claude/codex isolate via a config-home directory.
     (when-let ((home (plist-get md :config-home)))
       (let ((path (expand-file-name home)))
-        (pcase (agents-workflow-agent-backend agent)
+        (pcase backend
           ('claude (push (format "CLAUDE_CONFIG_DIR=%s" path) env))
           ('codex  (push (format "CODEX_HOME=%s" path) env)))))
+    ;; omp isolates via a named profile (not a directory).
+    (when (and (eq backend 'omp) personal agents-workflow-personal-omp-profile)
+      (push (format "OMP_PROFILE=%s" agents-workflow-personal-omp-profile) env))
     ;; Personal Google account for gws (any personal agent, any backend).
-    (when (and (agents-workflow--agent-personal-p agent)
-               agents-workflow-personal-gws-config-dir)
+    (when (and personal agents-workflow-personal-gws-config-dir)
       (push (format "GOOGLE_WORKSPACE_CLI_CONFIG_DIR=%s"
                     (expand-file-name agents-workflow-personal-gws-config-dir))
             env))
@@ -3189,6 +3206,11 @@ including dynamically-added ones."
                          (setq entry (plist-put entry :worktree-path wtp)))
                        (when-let ((eds (agents-workflow-agent-extra-directories agent)))
                          (setq entry (plist-put entry :extra-directories eds)))
+                       ;; Persist :metadata (e.g. :config-home / :section) so a
+                       ;; personal agent restored from state alone keeps its
+                       ;; account routing and Personal-section placement.
+                       (when-let ((md (agents-workflow-agent-metadata agent)))
+                         (setq entry (plist-put entry :metadata md)))
                        entry))
                    (agents-workflow-agents wf))))
       (when agent-states
@@ -3226,7 +3248,8 @@ Agents present in the state file but not in the workflow definition
                 (directory (plist-get state :directory))
                 (backend (plist-get state :backend))
                 (worktree-path (plist-get state :worktree-path))
-                (extra-dirs (plist-get state :extra-directories)))
+                (extra-dirs (plist-get state :extra-directories))
+                (metadata (plist-get state :metadata)))
             (if-let ((agent (agents-workflow--find-agent-by-name wf name)))
                 ;; Existing agent — restore session ID, directory, and worktree
                 (progn
@@ -3238,6 +3261,10 @@ Agents present in the state file but not in the workflow definition
                     (setf (agents-workflow-agent-worktree-path agent) worktree-path))
                   (when extra-dirs
                     (setf (agents-workflow-agent-extra-directories agent) extra-dirs))
+                  ;; Restore :metadata (account routing / Personal section) when
+                  ;; the state carries it; never clobber existing metadata with nil.
+                  (when metadata
+                    (setf (agents-workflow-agent-metadata agent) metadata))
                   (cl-incf restored))
               ;; Agent from a previous session — re-create it
               (let ((agent (make-agents-workflow-agent
@@ -3248,7 +3275,8 @@ Agents present in the state file but not in the workflow definition
                             :directory (or directory (agents-workflow-directory wf))
                             :session-id session-id
                             :worktree-path worktree-path
-                            :extra-directories extra-dirs)))
+                            :extra-directories extra-dirs
+                            :metadata metadata)))
                 (setf (agents-workflow-agents wf)
                       (append (agents-workflow-agents wf) (list agent)))
                 (cl-incf created)))))
