@@ -135,6 +135,8 @@ Constructs the event plist as the hook wrapper would send it
                    (setq fetch-args args)
                    ;; Use the real start-process for the dummy proc
                    (funcall orig-start-process "true" nil "true")))
+                ;; This test checks dispatch only, not the asynchronous UI.
+                ((symbol-function 'set-process-sentinel) #'ignore)
                 ((symbol-function 'github-prs--local-repo-dir)
                  (lambda (_pr) "/tmp"))
                 ((symbol-function 'shell-command-to-string)
