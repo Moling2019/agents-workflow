@@ -42,6 +42,7 @@
     (agents-work     :icon "work"        :face (:foreground "#89b4fa"))
     (agents-personal :icon "person"      :face (:foreground "#cba6f7"))
     (databricks  :icon "storage"         :face (:foreground "#fab387"))
+    (metaflow    :icon "device_hub"      :face (:foreground "#94e2d5"))
     (pulls       :icon "merge_type"      :face (:foreground "#cba6f7"))
     (channels    :icon "forum"           :face (:foreground "#a6e3a1"))
     (jira        :icon "assignment"      :face (:foreground "#89b4fa"))

@@ -125,6 +125,7 @@ BACKEND selects the CLI tool: `claude' (default) or `codex'."
 
 (defvar agents-workflow-panel-registry
   '(("databricks" databricks-runs-panel . databricks-runs)
+    ("metaflow" metaflow-runs-panel . metaflow-runs)
     ("jira" jira-board-panel . jira-board)
     ("slack" slack-monitor-panel . slack-monitor)
     ("github" github-prs-panel . github-prs)
@@ -132,6 +133,17 @@ BACKEND selects the CLI tool: `claude' (default) or `codex'."
   "Alist mapping panel name strings to (CONSTRUCTOR . FEATURE).
 Each constructor is a zero-arg function returning a panel plist.
 FEATURE is the symbol to `require' if the constructor is not yet loaded.")
+
+(defun agents-workflow--panel-names (names)
+  "Expand panel NAMES with Metaflow directly below Databricks.
+Preserve other panels' order and avoid duplicate Metaflow sections."
+  (let (result)
+    (dolist (name names)
+      (unless (and (equal name "metaflow") (member "databricks" names))
+        (cl-pushnew name result :test #'equal))
+      (when (equal name "databricks")
+        (cl-pushnew "metaflow" result :test #'equal)))
+    (nreverse result)))
 
 (defvar agents-workflow--expanded-agents (make-hash-table :test 'equal)
   "Hash table of agent names currently showing expanded directory view.")

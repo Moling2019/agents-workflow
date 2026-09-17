@@ -205,9 +205,62 @@ definition:
 Each panel has its own `defcustom` variables for configuration:
 
 - **databricks-runs** -- `databricks-runs-python`, `databricks-runs-env-file`, `databricks-runs-cli-profile`, `databricks-runs-repo-dir`
+- **metaflow-runs** -- appears directly below Databricks in both dashboard layouts; configure `metaflow-runs-monitor-directories`, `metaflow-runs-refresh-interval`, and `metaflow-runs-stale-seconds`.
 - **jira-board** -- `jira-board-python`, `jira-board-env-file`, `jira-board-site`, `jira-board-project`
 - **slack-monitor** -- `slack-monitor-cache-file`, `slack-monitor-ignore-file`
 - **github-prs** -- `github-prs-author`, `github-prs-state`, `github-prs-limit`, `github-prs-refresh-interval`, `github-prs-enrich`, `github-prs-gh-program`
+
+The **Metaflow Jobs** section refreshes every 30 seconds and shows
+one row per flow (and namespace), using its newest run. Rerunning a flow
+updates that row; **d** retains the full run history, including earlier
+failures and Spark children. Status cells use the same symbols, font and
+colors as Databricks. Hover over an icon for the full state; different
+child states appear as `MIXED` in the tooltip and details.
+
+**Parent** prefers the live Argo workflow phase when configured, otherwise
+the local Metaflow launcher's result. Spark status and watcher health stay
+separate. A local launcher failure can leave the remote flow and Spark child
+running; use **f** to check the remote flow's status in the Metaflow UI.
+An unknown-state icon with an `unverified` tooltip means the last observation is stale:
+the watcher stopped, timed out, failed, or its status is over two minutes old.
+Completed child results remain terminal even after their watcher exits.
+
+Use **f** to open the Metaflow flow UI, **RET** for the child's recorded
+Databricks URL, **d** for full IDs,
+states, run history and evidence files, **l** for the latest flow log, and
+**C-o** to expand from 3 to 30 unique flows.
+`M-x list-metaflow-runs` opens the section independently;
+`:panels ("metaflow")` enables it without Databricks.
+
+Set `metaflow-runs-ui-url-template` to your Metaflow UI address, for example
+`"https://metaflow.example/?flow_id=%f"`. `%f` is replaced by the URL-encoded
+flow name; templates for a specific run can also use `%r` for its run ID.
+
+Configure `metaflow-runs-argo-context` and `metaflow-runs-argo-namespace` to
+discover all Metaflow-labelled workflows retained in that Argo namespace,
+including scheduled jobs and jobs launched by other users or machines. This
+uses asynchronous `kubectl` calls with a 15-second API timeout and a 25-second
+process deadline, shared across dashboards. Kubectl and valid cluster credentials
+are required. Authentication/query failures show a warning row and mark cached
+parent observations unverified. **f** opens the Argo URL directly for these runs.
+The live Workflow API does not include deleted/archived runs or non-Argo flows.
+
+Local records from `launch_monitored.py`, Argo watchers, and `monitor_job.py`
+supplement remote runs with Spark IDs, status and diagnostics, without duplicate
+rows. Runs appear even without local records; their independent Spark status
+remains unknown until child evidence is available. Local-only mode is still
+available by leaving `metaflow-runs-argo-context` nil.
+
+The standard persistent monitor root is `~/.local/state/metaflow/jobs`.
+Legacy defaults also include `pin-job-monitors` under Emacs's temporary directory
+and `/tmp/pin-job-monitors`; set `metaflow-runs-monitor-directories` for other
+locations. Each launch folder contains `flow.log`, `monitor.json`, and
+eventually `flow-result.json`. Argo watchers instead provide `workflow.json`,
+`parent-status.json`, and a terminal `result.json`. Its `sjob_ID` child folders contain
+`status.json`, `pid`, and eventually `result.json`. Rearmed watchers with a
+suffix on the same child ID replace older observations. Keep these records
+in a persistent directory if you need history after temporary-file cleanup.
+The panel itself never launches, cancels, retries, or notifies agents.
 
 ### Personalization vs. package defaults
 
@@ -245,6 +298,7 @@ agents-workflow.el          Main package: workflow engine, agent lifecycle,
 claude-dashboard.el         Generic panel-based dashboard framework
 codex-cli.el                OpenAI Codex CLI terminal management
 databricks-runs.el          Optional: Databricks job run monitoring panel
+metaflow-runs.el            Metaflow launch, Spark child, and watcher status
 jira-board.el               Optional: Jira issue board panel
 slack-monitor.el            Optional: Slack message monitoring panel
 github-prs.el               Optional: GitHub PRs monitoring panel
