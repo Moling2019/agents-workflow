@@ -15,6 +15,7 @@
 ;;; Code:
 (require 'cl-lib)
 (require 'json)
+(require 'map)
 (require 'all-the-icons)
 (require 'claude-dashboard)
 (require 'codex-cli)
@@ -559,6 +560,37 @@ home such as ~/.claude-personal).  Everything else is Work."
         (equal (plist-get md :section) "personal")
         (and (plist-get md :config-home) t))))
 
+(defvar-local agents-workflow--codex-reply-cache nil
+  "Cached (SESSION-ID . LAST-OUTPUT) for this Codex terminal.
+Keep completion text across workflow reloads, including a cached nil when
+the session has no completed reply yet.")
+
+(defun agents-workflow--sync-codex-display (agent buffer)
+  "Reconcile AGENT's display fields with its live Codex BUFFER.
+This repairs restored workflow records even if no status transition fires.
+Backfill missing output once per session, without emitting workflow events
+from dashboard rendering."
+  (with-current-buffer buffer
+    (let ((status (cond
+                   ((codex-cli--working-p) 'running)
+                   ((eq codex-cli--status 'working) 'running)
+                   ((eq codex-cli--status 'idle) 'waiting))))
+      (when (and status (not (eq status (agents-workflow-agent-status agent))))
+        (setf (agents-workflow-agent-status agent) status
+              (agents-workflow-agent-last-activity agent) (float-time))))
+    (when-let ((sid (agents-workflow-agent-session-id agent)))
+      (unless (agents-workflow-agent-last-output agent)
+        (unless (equal (car agents-workflow--codex-reply-cache) sid)
+          (setq agents-workflow--codex-reply-cache
+                (cons sid
+                      (agents-workflow--last-sentence
+                       (agents-workflow--codex-last-assistant-message
+                        (agents-workflow-agent-directory agent) sid
+                        (plist-get (agents-workflow-agent-metadata agent)
+                                   :config-home))))))
+        (setf (agents-workflow-agent-last-output agent)
+              (cdr agents-workflow--codex-reply-cache))))))
+
 (defun agents-workflow--dashboard-entries (workflow &optional filter)
   "Generate dashboard entries from WORKFLOW agents.
 Returns a list of (ID [col-values ...]) for the agents panel :entries function.
@@ -571,6 +603,9 @@ When FILTER is non-nil, only agents satisfying it are included."
      ;; Try to reconnect stale/nil buffer references on each refresh
      (let ((buf (or (agents-workflow--ensure-agent-buffer agent)
                     (agents-workflow-agent-buffer agent))))
+       (when (and (buffer-live-p buf)
+                  (eq (agents-workflow-agent-backend agent) 'codex))
+         (agents-workflow--sync-codex-display agent buf))
        ;; Detect dead buffers and mark agent idle
        (when (and (not (and buf (buffer-live-p buf)))
                   (eq (agents-workflow-agent-type agent) 'interactive)
@@ -789,7 +824,7 @@ open a different workflow's main dashboard."
                      (list (agents-workflow-agents-panel-compact wf)))))
       ;; Mirror the main dashboard's optional-panel list.  Same auto-require
       ;; + registry-lookup pattern as `agents-workflow-dashboard'.
-      (dolist (panel-name (agents-workflow-panels wf))
+      (dolist (panel-name (agents-workflow--panel-names (agents-workflow-panels wf)))
         (when-let ((entry (alist-get panel-name agents-workflow-panel-registry
                                      nil nil #'equal)))
           (let ((constructor (car entry))
@@ -1221,15 +1256,13 @@ Per-backend fork mechanism:
             session via `opencode --session <src> --fork'.
 - omp:      resume the source session via `omp --resume <src>'; omp
             writes new turns to a new session file, preserving the original.
-- codex:    not supported (Codex has no fork primitive)."
+- codex:    launch `codex fork <src>' to create an independent session."
   (when-let* ((wf (agents-workflow--get wf-name))
               (src (agents-workflow--find-agent-by-name wf row-id)))
     (unless (eq (agents-workflow-agent-type src) 'interactive)
       (user-error "Fork only supported for interactive agents"))
     (let* ((backend (agents-workflow-agent-backend src))
            (src-dir (agents-workflow-agent-directory src)))
-      (when (eq backend 'codex)
-        (user-error "Fork is not supported for codex agents"))
       (unless (and src-dir (file-directory-p src-dir))
         (user-error "Source agent's directory does not exist: %s\n\
 Fix the workflow .eld file before forking — the cloned agent would
@@ -1246,7 +1279,7 @@ inherit the same broken path and produce an empty buffer"
           (agents-workflow--omp-capture-session-id src src-dir))))
       (let ((src-id (agents-workflow-agent-session-id src)))
         (unless src-id
-          (user-error "Source agent has no session-id yet — start it and send at least one message first"))
+          (user-error "Source agent has no session-id yet — complete a turn first"))
         ;; Default to the next free fork-N name; let the user override.
         (let* ((existing (mapcar #'agents-workflow-agent-name
                                  (agents-workflow-agents wf)))
@@ -1277,6 +1310,13 @@ inherit the same broken path and produce an empty buffer"
                            :worktree-path (agents-workflow-agent-worktree-path src)
                            :extra-directories (agents-workflow-agent-extra-directories src))))
               (pcase backend
+                ('codex
+                 ;; Keep the source separate from session-id, including
+                 ;; across saves/restarts before the first completion push.
+                 (setf (agents-workflow-agent-metadata agent)
+                       (plist-put
+                        (copy-tree (agents-workflow-agent-metadata src))
+                        :codex-fork-source src-id)))
                 ('claude
                  (agents-workflow--clone-session-files src-id new-id dir))
                 ('opencode
@@ -1500,7 +1540,7 @@ If WORKFLOW-NAME is nil, prompt from registered workflows."
                              (agents-workflow-agents-panel wf 'personal))
                      (list (agents-workflow-agents-panel wf)))))
       ;; Add optional panels listed in the workflow definition
-      (dolist (panel-name (agents-workflow-panels wf))
+      (dolist (panel-name (agents-workflow--panel-names (agents-workflow-panels wf)))
         (when-let ((entry (alist-get panel-name agents-workflow-panel-registry
                                      nil nil #'equal)))
           (let ((constructor (car entry))
@@ -2204,7 +2244,9 @@ Codex mints its own session id (unlike Claude's presettable
 Called lazily at teardown (before a restart) rather than on a launch
 timer.  No-op if AGENT already has a session-id or none is found yet."
   (when (and (agents-workflow-agent-p agent)
-             (not (agents-workflow-agent-session-id agent)))
+             (not (agents-workflow-agent-session-id agent))
+             (not (plist-get (agents-workflow-agent-metadata agent)
+                             :codex-fork-source)))
     (when-let ((sid (agents-workflow--codex-latest-session-id dir)))
       (setf (agents-workflow-agent-session-id agent) sid)
       (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
@@ -2296,8 +2338,15 @@ Falls back to the whole flattened string when no sentence break is found."
            ;; BEFORE the final sentence, then slice the final sentence off the
            ;; original (keeping its own terminator).
            (body (replace-regexp-in-string "[.!?]+\\'" "" flat))
-           (idx (string-match "[.!?][^.!?]*\\'" body))
-           (sentence (if idx (string-trim (substring flat (1+ idx))) flat)))
+           (start 0)
+           (idx nil)
+           (sentence nil))
+      ;; Only punctuation followed by whitespace separates sentences.
+      ;; A dot inside a URL or filename must not reduce the reply to "md).".
+      (while (string-match "[.!?] +" body start)
+        (setq idx (match-end 0)
+              start idx))
+      (setq sentence (if idx (substring flat idx) flat))
       (if (> (length sentence) 200)
           (concat (substring sentence 0 200) "…")
         sentence))))
@@ -2307,6 +2356,16 @@ Falls back to the whole flattened string when no sentence break is found."
   (let ((s (agents-workflow--last-sentence msg)))
     (when (and s (not (string-empty-p s)))
       (setf (agents-workflow-agent-last-output agent) s))))
+
+(defun agents-workflow--codex-title-message-p (msg)
+  "Return non-nil when MSG is a title-generation JSON object.
+Codex's auxiliary title request can trigger the same notify command as
+the main conversation.  Its single `title' field is metadata, not a reply."
+  (when (stringp msg)
+    (let ((obj (ignore-errors (json-parse-string msg))))
+      (and (hash-table-p obj)
+           (= (hash-table-count obj) 1)
+           (stringp (gethash "title" obj))))))
 
 (defun agents-workflow--codex-latest-rollout-file (dir)
   "Return the newest Codex rollout file whose cwd is DIR, or nil."
@@ -2330,36 +2389,57 @@ Falls back to the whole flattened string when no sentence break is found."
               (when (equal (file-truename (expand-file-name cwd)) target)
                 (throw 'found f)))))))))
 
-(defun agents-workflow--codex-last-assistant-message (dir)
+(defun agents-workflow--codex-final-message-in-buffer ()
+  "Return the latest final assistant message in the current rollout buffer."
+  (catch 'found
+    (dolist (line (nreverse (split-string (buffer-string) "\n" t)))
+      (when-let* ((obj (ignore-errors (json-parse-string line)))
+                  ((hash-table-p obj))
+                  (p (gethash "payload" obj))
+                  ((hash-table-p p)))
+        (when (and (equal (gethash "role" p) "assistant")
+                   (equal (gethash "type" p) "message")
+                   (member (gethash "phase" p) '(nil "final_answer")))
+          (let ((content (gethash "content" p)) (text ""))
+            (when (vectorp content)
+              (mapc (lambda (part)
+                      (when (and (hash-table-p part)
+                                 (stringp (gethash "text" part)))
+                        (setq text (concat text (gethash "text" part)))))
+                    content))
+            (unless (or (string-empty-p (string-trim text))
+                        (agents-workflow--codex-title-message-p text))
+              (throw 'found text))))))))
+
+(defun agents-workflow--codex-last-assistant-message
+    (dir &optional session-id config-home)
   "Return the text of Codex's most recent assistant message for DIR, or nil.
-Reads the tail of the newest matching rollout and returns the text of the
-last `role=assistant type=message' payload — the model's actual reply,
-with no TUI chrome."
-  (when-let ((file (agents-workflow--codex-latest-rollout-file dir)))
+When SESSION-ID is known, read only that session under CONFIG-HOME (default
+CODEX_HOME or ~/.codex).  Otherwise use the newest rollout matching DIR.
+Read progressively older history until a final reply is found, excluding
+commentary and generated titles.  Support older rollouts without phases."
+  (when-let ((file
+              (if session-id
+                  (let ((root (expand-file-name
+                               "sessions" (or config-home (getenv "CODEX_HOME")
+                                              "~/.codex"))))
+                    (when (file-directory-p root)
+                      (car (directory-files-recursively
+                            root (concat (regexp-quote session-id)
+                                         "\\.jsonl\\'")))))
+                (agents-workflow--codex-latest-rollout-file dir))))
     (ignore-errors
       (with-temp-buffer
         (let* ((size (file-attribute-size (file-attributes file)))
-               (start (if (and size (> size 262144)) (- size 262144) 0)))
-          (insert-file-contents file nil start size))
-        (let ((lines (nreverse (split-string (buffer-string) "\n" t)))
-              (result nil))
-          (catch 'done
-            (dolist (l lines)
-              (when-let* ((obj (ignore-errors (json-parse-string l)))
-                          ((hash-table-p obj))
-                          (p (gethash "payload" obj))
-                          ((hash-table-p p)))
-                (when (and (equal (gethash "role" p) "assistant")
-                           (equal (gethash "type" p) "message"))
-                  (let ((content (gethash "content" p)) (txt ""))
-                    (when (vectorp content)
-                      (dotimes (i (length content))
-                        (let ((c (aref content i)))
-                          (when (and (hash-table-p c) (stringp (gethash "text" c)))
-                            (setq txt (concat txt (gethash "text" c)))))))
-                    (unless (string-empty-p (string-trim txt))
-                      (setq result txt)
-                      (throw 'done nil)))))))
+               (bytes 262144)
+               (start size)
+               result)
+          (while (and (not result) (> start 0))
+            (setq start (max 0 (- size bytes)))
+            (erase-buffer)
+            (insert-file-contents file nil start size)
+            (setq result (agents-workflow--codex-final-message-in-buffer)
+                  bytes (* bytes 2)))
           result)))))
 
 (defun agents-workflow--opencode-capture-last-message-async (agent)
@@ -2433,7 +2513,10 @@ hook)."
   (pcase (agents-workflow-agent-backend agent)
     ('codex
      (when-let ((msg (agents-workflow--codex-last-assistant-message
-                      (agents-workflow-agent-directory agent))))
+                      (agents-workflow-agent-directory agent)
+                      (agents-workflow-agent-session-id agent)
+                      (plist-get (agents-workflow-agent-metadata agent)
+                                 :config-home))))
        (agents-workflow--set-last-output-sentence agent msg)))
     ('opencode
      (agents-workflow--opencode-capture-last-message-async agent))
@@ -2506,17 +2589,43 @@ The event JSON (carrying `last-assistant-message') is passed as a trailing
 emacsclient arg and popped from `server-eval-args-left'.  Routes to the
 agent by (WF-NAME, AGENT-NAME) when the notify wrapper supplies them —
 unambiguous even with several codex agents in one worktree — falling back
-to DIR.  Stores the reply's last sentence as last-output and marks it idle."
+to DIR.  Ignores title-generation notifications.  Stores the reply's last
+sentence and synchronizes the terminal and dashboard completion status."
   (let ((json (when server-eval-args-left (pop server-eval-args-left))))
     (setq server-eval-args-left nil)
-    (when-let ((agent (or (agents-workflow--find-agent-globally wf-name agent-name)
-                          (agents-workflow--find-agent-by-dir dir 'codex))))
-      (let ((msg (ignore-errors
-                   (let ((obj (json-parse-string json)))
-                     (and (hash-table-p obj)
-                          (gethash "last-assistant-message" obj))))))
-        (when (and (stringp msg) (not (string-empty-p (string-trim msg))))
-          (agents-workflow--set-last-output-sentence agent msg)))
+    (when-let* ((obj (ignore-errors (json-parse-string json)))
+                ((hash-table-p obj))
+                ((equal (gethash "type" obj) "agent-turn-complete"))
+                (msg (gethash "last-assistant-message" obj))
+                ((stringp msg))
+                ((not (agents-workflow--codex-title-message-p msg)))
+                (agent (or (agents-workflow--find-agent-by-session-id
+                            (gethash "thread-id" obj))
+                           (agents-workflow--find-agent-globally wf-name agent-name)
+                           (agents-workflow--find-agent-by-dir dir 'codex)))
+                ((eq (agents-workflow-agent-backend agent) 'codex)))
+      (let ((sid (gethash "thread-id" obj)))
+        (when (and (stringp sid) (not (string-empty-p sid)))
+          (setf (agents-workflow-agent-session-id agent) sid)
+          (when (plist-get (agents-workflow-agent-metadata agent)
+                           :codex-fork-source)
+            (setf (agents-workflow-agent-metadata agent)
+                  (map-delete (agents-workflow-agent-metadata agent)
+                              :codex-fork-source))
+            (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+              (agents-workflow--persist-workflow (agents-workflow-name wf))))))
+      (when (not (string-empty-p (string-trim msg)))
+        (agents-workflow--set-last-output-sentence agent msg))
+      ;; Keep this in sync with the dashboard.  Otherwise the next output
+      ;; sees an already-working buffer and never emits worker-running.
+      (when-let ((buffer (agents-workflow-agent-buffer agent)))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (codex-cli--cancel-idle-timer)
+            (setq agents-workflow--codex-reply-cache
+                  (cons (agents-workflow-agent-session-id agent)
+                        (agents-workflow-agent-last-output agent)))
+            (setq codex-cli--status 'idle))))
       (agents-workflow--mark-agent-idle-and-refresh agent)))
   nil)
 
@@ -2605,12 +2714,10 @@ session-id, stores the reply's last sentence as last-output, marks it idle."
 (defun agents-workflow--start-codex-interactive (agent)
   "Start interactive AGENT by creating a Codex eat terminal.
 If AGENT has a session-id, resume that Codex session via the `resume'
-subcommand; otherwise launch fresh.  Codex mints its own id (no preset
-flag like Claude's --session-id), so rather than racing a timer to read
-the rollout after launch, the id is resolved lazily from the rollout at
-teardown — on quit (`agents-workflow-save-state') and just before a
-restart (`agents-workflow--restart-agent-with-dirs') — when the rollout
-is fully written and the newest one for this cwd is unambiguously ours."
+subcommand.  Pending forks use `fork <source-id>'; otherwise launch fresh.
+The completion notification records the fork's own session-id and clears
+the pending source.  Until then, keep the source in metadata so restarting
+cannot accidentally resume the original conversation."
   (let* ((dir (agents-workflow-agent-directory agent))
          (instance-name (agents-workflow-agent-name agent))
          (existing (codex-cli--find-buffers-for-directory dir))
@@ -2622,10 +2729,14 @@ is fully written and the newest one for this cwd is unambiguously ours."
                     existing)))
     (if matching
         (setf (agents-workflow-agent-buffer agent) matching)
-      (let* ((session-id (agents-workflow-agent-session-id agent))
+      (let* ((fork-src (plist-get (agents-workflow-agent-metadata agent)
+                                 :codex-fork-source))
+             (session-id (agents-workflow-agent-session-id agent))
              ;; `resume <id>' is a subcommand; the base global switches
              ;; (sandbox, --no-alt-screen) legitimately precede it.
-             (resume-switches (when session-id (list "resume" session-id)))
+             (resume-switches (cond
+                               (fork-src (list "fork" fork-src))
+                               (session-id (list "resume" session-id))))
              (wf (agents-workflow--find-workflow-for-agent agent))
              ;; Thread agent identity into the env so the `notify' wrapper
              ;; (a subprocess of codex, which inherits this) can route the
@@ -2643,7 +2754,7 @@ is fully written and the newest one for this cwd is unambiguously ours."
           (let ((system-prompt (or (agents-workflow-agent-system-prompt agent)
                                    (agents-workflow--convention-system-prompt
                                     instance-name))))
-            (when system-prompt
+            (when (and system-prompt (not fork-src))
               (run-at-time 3 nil
                            (lambda ()
                              (when (buffer-live-p buffer)
@@ -3191,7 +3302,13 @@ including dynamically-added ones."
                      (let ((entry (list :name (agents-workflow-agent-name agent)
                                         :directory (agents-workflow-agent-directory agent))))
                        ;; Try to extract session-id from live process if not already set
-                       (let ((sid (or (agents-workflow-agent-session-id agent)
+                       (let ((sid (unless
+                                      (and (eq (agents-workflow-agent-backend agent)
+                                               'codex)
+                                           (plist-get
+                                            (agents-workflow-agent-metadata agent)
+                                            :codex-fork-source))
+                                    (or (agents-workflow-agent-session-id agent)
                                       (when-let ((buf (agents-workflow-agent-buffer agent)))
                                         (agents-workflow--extract-session-id-from-process buf))
                                       ;; Codex mints its own id and carries no
@@ -3207,7 +3324,7 @@ including dynamically-added ones."
                                         ('opencode (opencode-cli--latest-session-id-for-dir
                                                     (agents-workflow-agent-directory agent)))
                                         ('omp (omp-cli--latest-session-id-for-dir
-                                              (agents-workflow-agent-directory agent)))))))
+                                              (agents-workflow-agent-directory agent))))))))
                          (when sid
                            (setf (agents-workflow-agent-session-id agent) sid)
                            (setq entry (plist-put entry :session-id sid))))
@@ -3523,7 +3640,7 @@ For autonomous agents, enqueues it as a background task."
   (when (file-directory-p agents-workflow-projects-directory)
     (agents-workflow-load-directory agents-workflow-projects-directory)))
 
-(unless noninteractive
+(unless (or noninteractive (featurep 'agents-workflow))
   (if after-init-time
       (agents-workflow--auto-load)
     (add-hook 'after-init-hook #'agents-workflow--auto-load)))

@@ -116,15 +116,23 @@ to manage the workflow.
 
 ### Forking an agent (`c`)
 
-`c` on an interactive agent row creates a sibling agent whose Claude
-Code session is a copy of the source session at the moment of forking.
+`c` on an interactive agent row creates a sibling agent whose conversation
+is a copy of the source session at the moment of forking. This supports
+Claude Code and Codex, as well as the OpenCode and omp backends.
 After the fork point both sessions diverge — like a git branch.
 
 You'll be prompted for the fork's name. The default is
 `<original>-fork-N` (auto-incrementing); just press RET to accept, or
 type a custom name (e.g. `try-rewrite`, `experiment-v2`) to override.
 
-How it works under the hood:
+For Codex, the package launches `codex fork <source-session-id>`. The fork
+inherits the source's account settings and shares its working directory.
+Complete a turn in the source first so the package knows its session ID.
+The fork's own session ID is recorded when its first turn completes;
+subsequent restarts resume that independent conversation. Restarting a fork
+before its first completion branches from the source again.
+
+For Claude Code, it works as follows:
 
 1. The source agent's session transcript at
    `~/.claude/projects/<encoded-path>/<src-uuid>.jsonl` is copied to

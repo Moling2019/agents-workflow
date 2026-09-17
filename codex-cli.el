@@ -10,9 +10,9 @@
 ;; timer-based status detection for OpenAI Codex CLI sessions running
 ;; in eat terminals.  Designed as a companion to claude-workflow.el.
 ;;
-;; Status detection uses the same approach as ai-code-interface.el:
-;; after each meaningful terminal output, reset an idle timer.  When
-;; the timer fires (no new output for N seconds), the session is idle.
+;; Status detection watches the active-turn indicator on the terminal
+;; screen.  A silence timer settles to idle only after that indicator
+;; disappears; quiet tool calls and reasoning remain working.
 
 ;;; Code:
 (require 'cl-lib)
@@ -20,6 +20,8 @@
 ;; Forward declarations for eat
 (declare-function eat-make "eat")
 (declare-function eat-term-send-string "eat")
+(declare-function eat-term-display-beginning "eat")
+(declare-function eat-term-end "eat")
 (declare-function eat-semi-char-mode "eat")
 (declare-function eat--cursor-blink-mode "eat" (&optional arg))
 (declare-function eat--set-cursor "eat")
@@ -69,10 +71,9 @@ when using the devbox wrapper."
   :group 'codex-cli)
 
 (defcustom codex-cli-idle-delay 5
-  "Seconds of no terminal output before considering Codex idle.
-After each meaningful output chunk, the idle timer resets.  When
-no new output arrives for this many seconds, the status changes
-to `idle'."
+  "Seconds of silence before checking whether Codex is idle.
+The status changes to `idle' only when the active-turn indicator is
+absent.  Quiet reasoning or tool execution must remain `working'."
   :type 'number
   :group 'codex-cli)
 
@@ -251,7 +252,7 @@ BUFFER defaults to current buffer."
         ;; text, then an explicit CR to submit.
         (eat-term-send-string eat-terminal cmd)
         (eat-term-send-string eat-terminal "\r")
-        (run-hook-with-args 'codex-cli-status-change-functions buf 'working)))))
+        (codex-cli--set-status 'working)))))
 
 ;;;; Process management
 
@@ -280,10 +281,17 @@ BUFFER defaults to current buffer."
 (defvar-local codex-cli--status nil
   "Current status of this Codex buffer: `idle', `working', or nil.")
 
+(defun codex-cli--set-status (status)
+  "Set the current Codex buffer's STATUS and notify its workflow."
+  (unless (eq codex-cli--status status)
+    (setq codex-cli--status status)
+    (run-hook-with-args 'codex-cli-status-change-functions
+                       (current-buffer) status)))
+
 (defun codex-cli--install-idle-timer (buffer)
   "Install output watcher on BUFFER for timer-based idle detection.
 Each time new terminal output arrives, the idle timer resets.
-When the timer fires, the status changes to `idle'."
+When the timer fires, check the screen before changing to `idle'."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq codex-cli--status 'working)
@@ -295,12 +303,17 @@ When the timer fires, the status changes to `idle'."
 
 (defun codex-cli--working-p ()
   "Return non-nil if the visible screen shows Codex's active-turn indicator.
-Scans the tail of the current buffer (the on-screen region) for
-`codex-cli-working-regexp'."
-  (let ((start (max (point-min) (- (point-max) 4000)))
+Uses EAT's display boundaries to exclude scrollback.  In buffers without
+a terminal, falls back to the last 4000 characters."
+  (let ((start (if (bound-and-true-p eat-terminal)
+                   (eat-term-display-beginning eat-terminal)
+                 (max (point-min) (- (point-max) 4000))))
+        (end (if (bound-and-true-p eat-terminal)
+                 (eat-term-end eat-terminal)
+               (point-max)))
         (case-fold-search t))
     (string-match-p codex-cli-working-regexp
-                    (buffer-substring-no-properties start (point-max)))))
+                    (buffer-substring-no-properties start end))))
 
 (defun codex-cli--on-output (buffer)
   "Handle new terminal output in BUFFER.
@@ -310,27 +323,22 @@ silence timer that settles the session to `idle'."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (codex-cli--cancel-idle-timer)
-      (when (and (codex-cli--working-p)
-                 (not (eq codex-cli--status 'working)))
-        (setq codex-cli--status 'working)
-        (run-hook-with-args 'codex-cli-status-change-functions buffer 'working))
-      ;; Any output resets the silence timer.  While a turn is active
-      ;; Codex updates its elapsed-time counter every second, so the timer
-      ;; keeps resetting; when the turn ends, output stops and it fires.
+      (when (codex-cli--working-p)
+        (codex-cli--set-status 'working))
+      ;; Silence alone is not completion: recheck the active-turn hint
+      ;; when this fires, including during long reasoning/tool calls.
       (setq codex-cli--idle-timer
             (run-at-time codex-cli-idle-delay nil
                          #'codex-cli--idle-timer-fired buffer)))))
 
 (defun codex-cli--idle-timer-fired (buffer)
   "Called when BUFFER has had no output for `codex-cli-idle-delay' seconds.
-Sustained silence means the turn ended (or the interrupt hint got stuck
-with no further updates) — either way, settle to `idle'."
+Keep working if the active-turn indicator is still visible."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq codex-cli--idle-timer nil)
-      (unless (eq codex-cli--status 'idle)
-        (setq codex-cli--status 'idle)
-        (run-hook-with-args 'codex-cli-status-change-functions buffer 'idle)))))
+      (codex-cli--set-status
+       (if (codex-cli--working-p) 'working 'idle)))))
 
 (defun codex-cli--cancel-idle-timer ()
   "Cancel the idle timer in the current buffer."

@@ -2,6 +2,7 @@
 
 ;;; Code:
 (require 'ert)
+(require 'server)
 (require 'agents-workflow)
 
 ;;;; Dependency tests
@@ -16,6 +17,91 @@
                 codex-cli-status-change-functions)))
 
 ;;;; Agent struct tests
+
+(ert-deftest agents-workflow-test-codex-notifications ()
+  "Title and invalid notifications cannot finish the main turn."
+  (with-temp-buffer
+    (let* ((agent (make-agents-workflow-agent
+                   :name "codex" :backend 'codex :directory "/tmp/"
+                   :buffer (current-buffer) :status 'running
+                   :last-output "Previous reply."))
+           (wf (make-agents-workflow :name "codex-test" :agents (list agent)))
+           (agents-workflow--registry (make-hash-table :test 'equal))
+           (codex-cli-status-change-functions
+            '(agents-workflow--handle-codex-status)))
+      (puthash "codex-test" wf agents-workflow--registry)
+      (setq codex-cli--status 'working)
+      (cl-letf (((symbol-function 'claude-dashboard-refresh-all) #'ignore))
+        (dolist (payload '("not json"
+                           "{\"type\":\"other-event\",\"last-assistant-message\":\"wrong\"}"
+                           "{\"type\":\"agent-turn-complete\",\"last-assistant-message\":{}}"
+                           "{\"type\":\"agent-turn-complete\",\"thread-id\":\"title-thread\",\"last-assistant-message\":\"{\\\"title\\\":\\\"Analyze navigation pin experiment\\\"}\"}"))
+          (let ((server-eval-args-left (list payload)))
+            (agents-workflow-handle-codex-reply "/tmp/" "codex" "codex-test")
+            (should-not server-eval-args-left))
+          (should (eq (agents-workflow-agent-status agent) 'running))
+          (should (eq codex-cli--status 'working))
+          (should-not (agents-workflow-agent-session-id agent))
+          (should (equal (agents-workflow-agent-last-output agent)
+                         "Previous reply.")))
+        (let ((server-eval-args-left
+               (list (json-serialize
+                      '(:type "agent-turn-complete" :thread-id "main-thread"
+                        :last-assistant-message "First sentence. Actual final reply.")))))
+          (agents-workflow-handle-codex-reply "/tmp/" "codex" "codex-test"))
+        (should (equal (agents-workflow-agent-last-output agent)
+                       "Actual final reply."))
+        (should (equal (agents-workflow-agent-session-id agent) "main-thread"))
+        (should (eq (agents-workflow-agent-status agent) 'waiting))
+        (should (eq codex-cli--status 'idle))
+        ;; The next turn must notify the workflow even when it is stopped.
+        (insert "• Working (esc to interrupt)")
+        (unwind-protect
+            (progn
+              (codex-cli--on-output (current-buffer))
+              (should (eq codex-cli--status 'working))
+              (should (eq (agents-workflow-agent-status agent) 'running)))
+          (codex-cli--cancel-idle-timer))))))
+
+(ert-deftest agents-workflow-test-codex-json-reply ()
+  "JSON results with other fields remain valid assistant output."
+  (should-not (agents-workflow--codex-title-message-p
+               "{\"title\":\"Results\",\"count\":42}"))
+  (should-not (agents-workflow--codex-title-message-p "Regular text.")))
+
+(ert-deftest agents-workflow-test-last-sentence-preserves-links ()
+  "Periods in paths, URLs and decimals do not split the final sentence."
+  (dolist (sentence '("Repair details (/tmp/mcp-repair.md)."
+                      "See [the report](https://example.com/report.md)."
+                      "The final value is 2.5."
+                      "Actual final reply."))
+    (should (equal (agents-workflow--last-sentence
+                    (concat "First sentence.\n" sentence))
+                   sentence))))
+
+(ert-deftest agents-workflow-test-codex-rollout-final-message ()
+  "Rollout capture skips commentary and auxiliary title responses."
+  (let ((file (make-temp-file "codex-rollout-")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (dolist (entry '((nil . "Legacy final reply.")
+                             ("final_answer" . "Actual final reply.")
+                             ("final_answer" . "{\"title\":\"Conversation title\"}")
+                             ("commentary" . "Working on the next request.")))
+              (insert (json-serialize
+                       `(:type "response_item"
+                         :payload (:role "assistant" :type "message"
+                                   :phase ,(or (car entry) :null)
+                                   :content [(:type "output_text"
+                                              :text ,(cdr entry))])))
+                      "\n"))
+            (insert "{incomplete"))
+          (cl-letf (((symbol-function 'agents-workflow--codex-latest-rollout-file)
+                     (lambda (_dir) file)))
+            (should (equal (agents-workflow--codex-last-assistant-message "/tmp/")
+                           "Actual final reply."))))
+      (delete-file file))))
 
 (ert-deftest agents-workflow-test-make-agent ()
   "Creating an agent sets all fields correctly."

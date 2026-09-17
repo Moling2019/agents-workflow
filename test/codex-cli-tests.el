@@ -3,6 +3,9 @@
 (require 'ert)
 (require 'codex-cli)
 
+;; EAT is optional in batch tests; make its stub binding dynamic.
+(defvar eat-terminal nil)
+
 (ert-deftest codex-cli-test-buffer-name ()
   "Buffer name follows *codex:DIR:INSTANCE* format."
   (let ((name (codex-cli--buffer-name "/tmp/project" "worker")))
@@ -88,6 +91,54 @@
     (setq codex-cli--idle-timer nil)
     (codex-cli--cancel-idle-timer)
     (should (null codex-cli--idle-timer))))
+
+(ert-deftest codex-cli-test-silence-during-active-turn ()
+  "A quiet active turn stays working and does not emit idle."
+  (with-temp-buffer
+    (insert "• Working (2m 10s • esc to interrupt)")
+    (setq codex-cli--status 'working)
+    (let* ((events nil)
+           (codex-cli-status-change-functions
+            (list (lambda (_buf status) (push status events)))))
+      (codex-cli--idle-timer-fired (current-buffer))
+      (should (eq codex-cli--status 'working))
+      (should-not events)
+      (erase-buffer)
+      (insert "› Ask Codex to do anything")
+      (codex-cli--idle-timer-fired (current-buffer))
+      (should (eq codex-cli--status 'idle))
+      (should (equal events '(idle))))))
+
+(ert-deftest codex-cli-test-working-excludes-scrollback ()
+  "A previous active-turn hint in scrollback does not count."
+  (with-temp-buffer
+    (insert "• Working (esc to interrupt)\n")
+    (let ((screen-start (point))
+          (eat-terminal 'test-terminal))
+      (insert "› Ask Codex to do anything")
+      (cl-letf (((symbol-function 'eat-term-display-beginning)
+                 (lambda (_term) screen-start))
+                ((symbol-function 'eat-term-end)
+                 (lambda (_term) (point-max))))
+        (should-not (codex-cli--working-p))
+        (insert "\n• Working (esc to interrupt)")
+        (should (codex-cli--working-p))))))
+
+(ert-deftest codex-cli-test-send-synchronizes-status ()
+  "Sending a request updates both buffer status and status listeners."
+  (with-temp-buffer
+    (setq codex-cli--status 'idle)
+    (let* ((eat-terminal 'test-terminal)
+           (sent nil)
+           (events nil)
+           (codex-cli-status-change-functions
+            (list (lambda (_buf status) (push status events)))))
+      (cl-letf (((symbol-function 'eat-term-send-string)
+                 (lambda (_term str) (push str sent))))
+        (codex-cli--send-command "hello"))
+      (should (equal (nreverse sent) '("hello" "\r")))
+      (should (eq codex-cli--status 'working))
+      (should (equal events '(working))))))
 
 (ert-deftest codex-cli-test-nonblinking-cursor-type ()
   "Blinking cursor mappings are converted to non-blinking ones."
