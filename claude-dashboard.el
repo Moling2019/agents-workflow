@@ -197,6 +197,9 @@ Each data row gets `dashboard-panel' and `dashboard-row-id' text properties."
 (defvar-local claude-dashboard--timers nil
   "List of active refresh timers for this buffer.")
 
+(defvar claude-dashboard--automatic-refresh nil
+  "Non-nil while a visible panel is refreshed by its timer.")
+
 (defvar-local claude-dashboard--current-panel nil
   "Name of the panel under point (cached for mode-line).")
 
@@ -356,6 +359,12 @@ Erases buffer and re-renders from scratch."
           (goto-char (point-min))
           (forward-line (1- saved-win-line))
           (set-window-start win (point) t))))))
+
+(defun claude-dashboard--refresh-visible-panel (buf panel)
+  "Refresh PANEL in BUF only when it is displayed on a visible frame."
+  (when (and (buffer-live-p buf) (get-buffer-window buf 'visible))
+    (let ((claude-dashboard--automatic-refresh t))
+      (claude-dashboard--refresh-panel buf panel))))
 
 (defun claude-dashboard--refresh-panel (buf panel)
   "Refresh a single PANEL section within dashboard BUF.
@@ -532,7 +541,7 @@ Returns the dashboard buffer."
       (dolist (panel panels)
         (when-let ((interval (plist-get panel :interval)))
           (let ((timer (run-at-time interval interval
-                                    #'claude-dashboard--refresh-panel
+                                    #'claude-dashboard--refresh-visible-panel
                                     buf panel)))
             (push timer claude-dashboard--timers)))))
     buf))

@@ -400,9 +400,34 @@ Keep separate Spark children; collapse rearmed watchers for the same ID."
            (error . ,(alist-get 'error child-result)))))
      (or children '(nil)))))
 
-(defun metaflow-runs--refresh ()
-  "Refresh local records and start asynchronous Argo discovery when configured."
-  (metaflow-runs--argo-fetch)
+(defvar metaflow-runs--local-cache nil
+  "Local records shared by automatic dashboard refreshes.")
+
+(defvar metaflow-runs--local-cache-time nil
+  "Time at which the shared local scan started, or nil before the first scan.")
+
+(defvar metaflow-runs--local-cache-config nil
+  "Monitor directories and staleness setting used by the shared local scan.")
+
+(defun metaflow-runs--local-records (&optional reuse)
+  "Return local records, reusing a recent scan when REUSE is non-nil.
+Manual refreshes bypass the cache.  Return a copy so remote observations
+and sorting cannot modify the shared local records."
+  (let ((now (float-time))
+        (config (list metaflow-runs-monitor-directories
+                      metaflow-runs-stale-seconds)))
+    (unless (and reuse metaflow-runs--local-cache-time
+                 (equal config metaflow-runs--local-cache-config)
+                 (<= metaflow-runs--local-cache-time now)
+                 (< (- now metaflow-runs--local-cache-time)
+                    metaflow-runs-refresh-interval))
+      (setq metaflow-runs--local-cache (metaflow-runs--scan-local-records)
+            metaflow-runs--local-cache-time now
+            metaflow-runs--local-cache-config (copy-tree config)))
+    (copy-tree metaflow-runs--local-cache)))
+
+(defun metaflow-runs--scan-local-records ()
+  "Read local launch records once for all dashboard instances."
   (let ((seen (make-hash-table :test #'equal)) records)
     (dolist (root metaflow-runs-monitor-directories)
       (when (file-directory-p root)
@@ -420,6 +445,14 @@ Keep separate Spark children; collapse rearmed watchers for the same ID."
                        (spark_state . "UNKNOWN") (monitor_state . "READ ERROR")
                        (start_time . 0) (end_time . 0) (directory . ,dir)
                        (error . ,(error-message-string err))) records)))))))
+    records))
+
+(defun metaflow-runs--refresh (&optional cached-only)
+  "Refresh records and start discovery unless CACHED-ONLY is non-nil.
+Automatic refreshes share local scans for one refresh interval."
+  (unless cached-only (metaflow-runs--argo-fetch))
+  (let ((records (metaflow-runs--local-records
+                  (or cached-only claude-dashboard--automatic-refresh))))
     (setq metaflow-runs--cache
           (sort (if metaflow-runs-argo-context
                     (metaflow-runs--merge-argo records)
