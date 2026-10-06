@@ -21,6 +21,7 @@
 (declare-function eat-make "eat")
 (declare-function eat-term-send-string "eat")
 (declare-function eat-term-display-beginning "eat")
+(declare-function eat-term-display-cursor "eat")
 (declare-function eat-term-end "eat")
 (declare-function eat-semi-char-mode "eat")
 (declare-function eat--cursor-blink-mode "eat" (&optional arg))
@@ -34,6 +35,7 @@
 (defvar eat--cursor-blink-mode)
 (defvar eat-terminal)
 (defvar eat-update-hook)
+(defvar eat--synchronize-scroll-function)
 
 ;; Forward declarations for claude-code.el terminal abstraction
 (declare-function claude-code--term-make "claude-code")
@@ -183,6 +185,10 @@ Returns the buffer, or nil if creation failed."
 
 (defun codex-cli--setup-buffer-appearance ()
   "Configure the current buffer to look like a polished Codex terminal."
+  ;; Recentring on every terminal update also runs during keyboard input.
+  ;; Follow EAT's screen boundaries without forcing a layout calculation.
+  (setq-local eat--synchronize-scroll-function
+              #'codex-cli--synchronize-scroll)
   ;; Remove visual clutter
   (setq-local vertical-scroll-bar nil)
   (when-let ((win (get-buffer-window (current-buffer))))
@@ -209,6 +215,23 @@ Returns the buffer, or nil if creation failed."
                (propertize
                 (abbreviate-file-name default-directory)
                 'face 'font-lock-comment-face))))
+
+;;;; Terminal scrolling
+
+(defun codex-cli--synchronize-scroll (windows)
+  "Follow the terminal cursor in WINDOWS without repeated recentering.
+WINDOWS comes from EAT's scroll tracking and may include the symbol
+`buffer'.  Leave read-only scrollback windows untouched."
+  (when eat-terminal
+    (let ((cursor (eat-term-display-cursor eat-terminal))
+          (start (eat-term-display-beginning eat-terminal)))
+      (dolist (window windows)
+        (if (eq window 'buffer)
+            (goto-char cursor)
+          (unless buffer-read-only
+            (set-window-point window cursor)
+            (unless (= (window-start window) start)
+              (set-window-start window start t))))))))
 
 ;;;; Cursor visibility
 
@@ -312,8 +335,10 @@ a terminal, falls back to the last 4000 characters."
                  (eat-term-end eat-terminal)
                (point-max)))
         (case-fold-search t))
-    (string-match-p codex-cli-working-regexp
-                    (buffer-substring-no-properties start end))))
+    (save-excursion
+      (goto-char start)
+      (save-match-data
+        (re-search-forward codex-cli-working-regexp end t)))))
 
 (defun codex-cli--on-output (buffer)
   "Handle new terminal output in BUFFER.

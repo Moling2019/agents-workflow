@@ -6,6 +6,53 @@
 ;; EAT is optional in batch tests; make its stub binding dynamic.
 (defvar eat-terminal nil)
 
+(ert-deftest codex-cli-test-scroll-follows-screen-without-recentering ()
+  "Typing keeps the viewport stable; new terminal rows advance it."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert (make-string 100 ?\n))
+      (let ((eat-terminal 'terminal)
+            (start 10)
+            (cursor 15)
+            (window (selected-window)))
+        (set-window-buffer window (current-buffer))
+        (cl-letf (((symbol-function 'eat-term-display-beginning)
+                   (lambda (_) start))
+                  ((symbol-function 'eat-term-display-cursor)
+                   (lambda (_) cursor))
+                  ((symbol-function 'recenter)
+                   (lambda (&rest _) (ert-fail "Recentered during typing"))))
+          (codex-cli--synchronize-scroll (list 'buffer window))
+          (should (= (point) cursor))
+          (should (= (window-start window) start))
+          (setq cursor 16)
+          (codex-cli--synchronize-scroll (list 'buffer window))
+          (should (= (window-point window) cursor))
+          (should (= (window-start window) start))
+          (setq start 11 cursor 17)
+          (codex-cli--synchronize-scroll (list window))
+          (should (= (window-start window) start))
+          (should (= (window-point window) cursor))
+          ;; Browsing scrollback must not jump to the live terminal.
+          (setq buffer-read-only t start 20 cursor 25)
+          (codex-cli--synchronize-scroll (list window))
+          (should (= (window-start window) 11))
+          (should (= (window-point window) 17)))))))
+
+(ert-deftest codex-cli-test-working-check-preserves-point-and-match-data ()
+  "Inspect the terminal screen without copying it or moving the user's point."
+  (with-temp-buffer
+    (insert "scrollback\nWorking (esc to interrupt)\n")
+    (goto-char (point-min))
+    (string-match "keep" "keep")
+    (let ((position (point))
+          (matches (match-data)))
+      (cl-letf (((symbol-function 'buffer-substring-no-properties)
+                 (lambda (&rest _) (ert-fail "Copied terminal screen"))))
+        (should (codex-cli--working-p))
+        (should (= (point) position))
+        (should (equal (match-data) matches))))))
+
 (ert-deftest codex-cli-test-buffer-name ()
   "Buffer name follows *codex:DIR:INSTANCE* format."
   (let ((name (codex-cli--buffer-name "/tmp/project" "worker")))
