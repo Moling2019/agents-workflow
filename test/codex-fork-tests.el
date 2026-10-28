@@ -36,10 +36,21 @@
                    (lambda (&rest _) (ert-fail "Fork resent a startup prompt"))))
           (agents-workflow--panel-fork-agent "fork-test" "source")
           (let ((fork (cadr (agents-workflow-agents wf))))
-            (should (equal (car launches)
-                           (list temporary-file-directory "source-fork-1"
-                                 '("fork" "source-id")
-                                 (expand-file-name "~/.codex-personal"))))
+            (should (equal (car (car launches)) temporary-file-directory))
+            (should (equal (nth 1 (car launches)) "source-fork-1"))
+            (should (equal (last (nth 2 (car launches)) 2)
+                           '("fork" "source-id")))
+            (should (equal (nth 3 (car launches))
+                           (expand-file-name "~/.codex-personal")))
+            (let ((notify (json-parse-string
+                           (string-remove-prefix
+                            "notify=" (nth 1 (nth 2 (car launches)))))))
+              (should (equal (aref notify 1) "--route"))
+              (should (equal (aref notify 2) "fork-test"))
+              (should (equal (aref notify 3) "source-fork-1"))
+              (should (equal (aref notify 4)
+                             (plist-get (agents-workflow-agent-metadata fork)
+                                        :codex-notify-token))))
             (should-not (agents-workflow-agent-session-id fork))
             (should (equal (agents-workflow-agent-worktree-path fork)
                            "/shared/worktree"))
@@ -52,7 +63,9 @@
                           '(:type "agent-turn-complete" :thread-id "fork-id"
                             :last-assistant-message "Independent reply.")))))
               (agents-workflow-handle-codex-reply
-               temporary-file-directory "source-fork-1" "fork-test"))
+               temporary-file-directory "source-fork-1" "fork-test"
+               (plist-get (agents-workflow-agent-metadata fork)
+                          :codex-notify-token)))
             (should (equal (agents-workflow-agent-session-id fork) "fork-id"))
             (should (equal (agents-workflow-agent-session-id src) "source-id"))
             (should (equal (agents-workflow-agent-last-output fork)
@@ -62,11 +75,12 @@
                                       :codex-fork-source))
             (should (eq (plist-get (agents-workflow-agent-metadata fork) :section)
                         'personal))
-            (should (= (length saved) 2))
+            (should (= (length saved) 3))
             (cl-letf (((symbol-function 'agents-workflow--convention-system-prompt)
                        (lambda (_name) nil)))
               (agents-workflow--start-codex-interactive fork))
-            (should (equal (nth 2 (car launches)) '("resume" "fork-id")))))
+            (should (equal (last (nth 2 (car launches)) 2)
+                           '("resume" "fork-id")))))
       (kill-buffer buf))))
 
 (ert-deftest codex-fork-test-pending-state-does-not-claim-source ()

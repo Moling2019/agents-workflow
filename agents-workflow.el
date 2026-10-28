@@ -31,6 +31,11 @@
 ;; Dynamic var from the `server' package; the turn-end push receivers read
 ;; the trailing emacsclient arg from it (same mechanism as claude-code).
 (defvar server-eval-args-left)
+
+(defconst agents-workflow--codex-notify-program
+  (expand-file-name "bin/agents-workflow-codex-notify"
+                    (file-name-directory (or load-file-name buffer-file-name)))
+  "Notification bridge used by individually configured Codex sessions.")
 (require 'databricks-runs nil t)
 (require 'jira-board nil t)
 (require 'slack-monitor nil t)
@@ -579,6 +584,10 @@ from dashboard rendering."
         (setf (agents-workflow-agent-status agent) status
               (agents-workflow-agent-last-activity agent) (float-time))))
     (when-let ((sid (agents-workflow-agent-session-id agent)))
+      (when (and agents-workflow--codex-reply-cache
+                 (not (equal (car agents-workflow--codex-reply-cache) sid)))
+        (setq agents-workflow--codex-reply-cache nil)
+        (setf (agents-workflow-agent-last-output agent) nil))
       (unless (agents-workflow-agent-last-output agent)
         (unless (equal (car agents-workflow--codex-reply-cache) sid)
           (setq agents-workflow--codex-reply-cache
@@ -2240,17 +2249,12 @@ Codex mints its own session id (unlike Claude's presettable
                 (throw 'found sid)))))))))
 
 (defun agents-workflow--codex-capture-session-id (agent dir)
-  "Resolve AGENT's Codex session id from the rollout for DIR and persist it.
-Called lazily at teardown (before a restart) rather than on a launch
-timer.  No-op if AGENT already has a session-id or none is found yet."
-  (when (and (agents-workflow-agent-p agent)
-             (not (agents-workflow-agent-session-id agent))
-             (not (plist-get (agents-workflow-agent-metadata agent)
-                             :codex-fork-source)))
-    (when-let ((sid (agents-workflow--codex-latest-session-id dir)))
-      (setf (agents-workflow-agent-session-id agent) sid)
-      (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
-        (agents-workflow--persist-workflow (agents-workflow-name wf))))))
+  "Return AGENT's recorded Codex session id without guessing from DIR.
+Several terminals can share a directory and server.  Only an explicitly
+routed notification can establish an initially unknown session."
+  (ignore dir)
+  (when (agents-workflow-agent-p agent)
+    (agents-workflow-agent-session-id agent)))
 
 (defun agents-workflow--opencode-capture-session-id (agent dir)
   "Resolve AGENT's OpenCode session id from the project session list for DIR.
@@ -2512,9 +2516,10 @@ exports asynchronously.  A no-op for other backends (claude uses its Stop
 hook)."
   (pcase (agents-workflow-agent-backend agent)
     ('codex
-     (when-let ((msg (agents-workflow--codex-last-assistant-message
+     (when-let* ((sid (agents-workflow-agent-session-id agent))
+                 (msg (agents-workflow--codex-last-assistant-message
                       (agents-workflow-agent-directory agent)
-                      (agents-workflow-agent-session-id agent)
+                      sid
                       (plist-get (agents-workflow-agent-metadata agent)
                                  :config-home))))
        (agents-workflow--set-last-output-sentence agent msg)))
@@ -2583,14 +2588,51 @@ Emits `worker-waiting' only when the owning workflow is running."
           :agent ,(agents-workflow-agent-name agent)))))
   (ignore-errors (claude-dashboard-refresh-all)))
 
-(defun agents-workflow-handle-codex-reply (dir &optional agent-name wf-name)
+(defun agents-workflow--codex-reply-owner (sid agent-name wf-name token)
+  "Resolve SID using explicit AGENT-NAME, WF-NAME and launch TOKEN.
+Without TOKEN, accept only a uniquely owned legacy session.  Never use
+the shared daemon's environment or working directory to infer ownership."
+  (let (owners)
+    (when (and (stringp sid) (not (string-empty-p sid)))
+      (maphash
+       (lambda (_ wf)
+         (dolist (agent (agents-workflow-agents wf))
+           (when (and (eq (agents-workflow-agent-backend agent) 'codex)
+                      (equal sid (agents-workflow-agent-session-id agent)))
+             (cl-pushnew agent owners :test #'eq))))
+       agents-workflow--registry)
+      (if (and (stringp token) (not (string-empty-p token)))
+          (when-let ((agent (agents-workflow--find-agent-globally
+                            wf-name agent-name)))
+            (when (and (eq (agents-workflow-agent-backend agent) 'codex)
+                       (equal token
+                              (plist-get (agents-workflow-agent-metadata agent)
+                                         :codex-notify-token))
+                       (or (null owners)
+                           (and (null (cdr owners)) (eq (car owners) agent)))
+                       (or (null (agents-workflow-agent-session-id agent))
+                           (equal sid (agents-workflow-agent-session-id agent)))
+                       (not (equal sid
+                                   (plist-get
+                                    (agents-workflow-agent-metadata agent)
+                                    :codex-fork-source))))
+              agent))
+        (when (and (null (cdr owners)) (car owners)
+                   (not (plist-get
+                         (agents-workflow-agent-metadata (car owners))
+                         :codex-notify-token)))
+          (car owners))))))
+
+(defun agents-workflow-handle-codex-reply
+    (dir &optional agent-name wf-name token)
   "Receive a Codex `agent-turn-complete' notification for cwd DIR.
 The event JSON (carrying `last-assistant-message') is passed as a trailing
 emacsclient arg and popped from `server-eval-args-left'.  Routes to the
-agent by (WF-NAME, AGENT-NAME) when the notify wrapper supplies them —
-unambiguous even with several codex agents in one worktree — falling back
-to DIR.  Ignores title-generation notifications.  Stores the reply's last
+agent by its unique thread id, or explicit WF-NAME, AGENT-NAME and launch
+TOKEN for a new session.  DIR and inherited environment are never used
+to guess ownership.  Ignores title-generation notifications.  Stores the last
 sentence and synchronizes the terminal and dashboard completion status."
+  (ignore dir)
   (let ((json (when server-eval-args-left (pop server-eval-args-left))))
     (setq server-eval-args-left nil)
     (when-let* ((obj (ignore-errors (json-parse-string json)))
@@ -2599,21 +2641,25 @@ sentence and synchronizes the terminal and dashboard completion status."
                 (msg (gethash "last-assistant-message" obj))
                 ((stringp msg))
                 ((not (agents-workflow--codex-title-message-p msg)))
-                (agent (or (agents-workflow--find-agent-by-session-id
-                            (gethash "thread-id" obj))
-                           (agents-workflow--find-agent-globally wf-name agent-name)
-                           (agents-workflow--find-agent-by-dir dir 'codex)))
+                (agent (or (agents-workflow--codex-reply-owner
+                            (gethash "thread-id" obj) agent-name wf-name token)
+                           (progn
+                             (message
+                              "Codex reply ignored: unknown or conflicting owner for %s"
+                              (gethash "thread-id" obj))
+                             nil)))
                 ((eq (agents-workflow-agent-backend agent) 'codex)))
       (let ((sid (gethash "thread-id" obj)))
-        (when (and (stringp sid) (not (string-empty-p sid)))
+        (when (and (stringp sid) (not (string-empty-p sid))
+                   (not (equal sid (agents-workflow-agent-session-id agent))))
           (setf (agents-workflow-agent-session-id agent) sid)
           (when (plist-get (agents-workflow-agent-metadata agent)
                            :codex-fork-source)
             (setf (agents-workflow-agent-metadata agent)
                   (map-delete (agents-workflow-agent-metadata agent)
-                              :codex-fork-source))
-            (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
-              (agents-workflow--persist-workflow (agents-workflow-name wf))))))
+                              :codex-fork-source)))
+          (when-let ((wf (agents-workflow--find-workflow-for-agent agent)))
+            (agents-workflow--persist-workflow (agents-workflow-name wf)))))
       (when (not (string-empty-p (string-trim msg)))
         (agents-workflow--set-last-output-sentence agent msg))
       ;; Keep this in sync with the dashboard.  Otherwise the next output
@@ -2738,19 +2784,34 @@ cannot accidentally resume the original conversation."
                                (fork-src (list "fork" fork-src))
                                (session-id (list "resume" session-id))))
              (wf (agents-workflow--find-workflow-for-agent agent))
-             ;; Thread agent identity into the env so the `notify' wrapper
-             ;; (a subprocess of codex, which inherits this) can route the
-             ;; turn-end push back to THIS agent even when several share a
-             ;; worktree (the Claude CLAUDE_BUFFER_NAME pattern).
+             (notify-token (agents-workflow--generate-uuid))
+             (notify-command
+              (vector agents-workflow--codex-notify-program "--route"
+                      (if wf (agents-workflow-name wf) "") instance-name
+                      notify-token))
+             ;; Keep environment hints for other integrations, but route
+             ;; notifications through per-thread config, not daemon env.
              (process-environment
               (append (agents-workflow--agent-account-env agent)
                       (list (format "AGENTS_WORKFLOW_AGENT=%s" instance-name)
                             (format "AGENTS_WORKFLOW_NAME=%s"
                                     (if wf (agents-workflow-name wf) "")))
                       process-environment))
-             (buffer (codex-cli--start dir instance-name resume-switches)))
+             (buffer
+              (progn
+                (setf (agents-workflow-agent-metadata agent)
+                      (plist-put (copy-sequence
+                                  (agents-workflow-agent-metadata agent))
+                                 :codex-notify-token notify-token))
+                (codex-cli--start
+                 dir instance-name
+                 (append (list "-c" (concat "notify="
+                                           (json-serialize notify-command)))
+                         resume-switches)))))
         (when buffer
           (setf (agents-workflow-agent-buffer agent) buffer)
+          (when wf
+            (agents-workflow--persist-workflow (agents-workflow-name wf)))
           (let ((system-prompt (or (agents-workflow-agent-system-prompt agent)
                                    (agents-workflow--convention-system-prompt
                                     instance-name))))
@@ -3309,18 +3370,15 @@ including dynamically-added ones."
                                             (agents-workflow-agent-metadata agent)
                                             :codex-fork-source))
                                     (or (agents-workflow-agent-session-id agent)
-                                      (when-let ((buf (agents-workflow-agent-buffer agent)))
+                                      (when-let* (((not (eq
+                                                       (agents-workflow-agent-backend agent)
+                                                       'codex)))
+                                                  (buf (agents-workflow-agent-buffer agent)))
                                         (agents-workflow--extract-session-id-from-process buf))
-                                      ;; Codex mints its own id and carries no
-                                      ;; --session-id flag, so the process-args
-                                      ;; path above can't recover it (and the
-                                      ;; one-shot capture timer may have missed
-                                      ;; the rollout).  Fall back to the newest
-                                      ;; rollout whose cwd matches the agent's
-                                      ;; directory — works even with a dead buffer.
+                                      ;; Codex must keep an unknown identity
+                                      ;; unknown.  Directory discovery remains
+                                      ;; specific to the other backends.
                                       (pcase (agents-workflow-agent-backend agent)
-                                        ('codex (agents-workflow--codex-latest-session-id
-                                                 (agents-workflow-agent-directory agent)))
                                         ('opencode (opencode-cli--latest-session-id-for-dir
                                                     (agents-workflow-agent-directory agent)))
                                         ('omp (omp-cli--latest-session-id-for-dir

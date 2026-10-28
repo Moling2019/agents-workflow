@@ -6,15 +6,28 @@
 # process inherits Codex's environment + working directory.  We push the
 # finished reply to Emacs, mirroring Claude Code's Stop hook: the JSON is
 # passed as a trailing emacsclient arg and read from `server-eval-args-left'
-# by `agents-workflow-handle-codex-reply'.  The agent identity
-# (AGENTS_WORKFLOW_AGENT / AGENTS_WORKFLOW_NAME, exported by agents-workflow
-# at launch) is forwarded so the push routes to the right agent even when
-# several codex agents share one worktree; PWD is a fallback.
-json="$1"
+# by `agents-workflow-handle-codex-reply'.  Explicit per-session arguments
+# carry workflow, agent and launch identity.  A shared app server inherits
+# only its first client's environment, so never use environment identity.
+wf=""
+agent=""
+token=""
+if [[ "${1:-}" == "--route" ]]; then
+    [[ "$#" -eq 5 ]] || exit 0
+    wf="$2"
+    agent="$3"
+    token="$4"
+    json="$5"
+else
+    [[ "$#" -eq 1 ]] || exit 0
+    # Existing terminals can still notify using their unique thread ID.
+    json="$1"
+fi
 [ -z "$json" ] && exit 0
 esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
 dir="$(esc "$PWD")"
-agent="$(esc "${AGENTS_WORKFLOW_AGENT:-}")"
-wf="$(esc "${AGENTS_WORKFLOW_NAME:-}")"
-emacsclient --eval "(agents-workflow-handle-codex-reply \"$dir\" \"$agent\" \"$wf\")" "$json" >/dev/null 2>&1 || true
+agent="$(esc "$agent")"
+wf="$(esc "$wf")"
+token="$(esc "$token")"
+emacsclient --eval "(agents-workflow-handle-codex-reply \"$dir\" \"$agent\" \"$wf\" \"$token\")" "$json" >/dev/null 2>&1 || true
 exit 0

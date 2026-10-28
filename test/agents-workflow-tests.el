@@ -24,6 +24,7 @@
     (let* ((agent (make-agents-workflow-agent
                    :name "codex" :backend 'codex :directory "/tmp/"
                    :buffer (current-buffer) :status 'running
+                   :metadata '(:codex-notify-token "launch-token")
                    :last-output "Previous reply."))
            (wf (make-agents-workflow :name "codex-test" :agents (list agent)))
            (agents-workflow--registry (make-hash-table :test 'equal))
@@ -48,7 +49,8 @@
                (list (json-serialize
                       '(:type "agent-turn-complete" :thread-id "main-thread"
                         :last-assistant-message "First sentence. Actual final reply.")))))
-          (agents-workflow-handle-codex-reply "/tmp/" "codex" "codex-test"))
+          (agents-workflow-handle-codex-reply
+           "/tmp/" "codex" "codex-test" "launch-token"))
         (should (equal (agents-workflow-agent-last-output agent)
                        "Actual final reply."))
         (should (equal (agents-workflow-agent-session-id agent) "main-thread"))
